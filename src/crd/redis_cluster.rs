@@ -1,9 +1,9 @@
-use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use k8s_openapi::api::core::v1::TopologySpreadConstraint;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::redis::{ResourcesSpec, StorageSpec};
+use super::redis::{PodDisruptionBudgetSpec, ResourcesSpec, StorageSpec};
 
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
 #[kube(
@@ -49,28 +49,25 @@ pub struct RedisClusterSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourcesSpec>,
 
+    /// PodDisruptionBudget for the cluster's pods. Opt-in, and validated against
+    /// the topology: the safe maximum is the smaller of the master-majority
+    /// slack `(masters - 1) / 2` and `replicasPerMaster`. For the default
+    /// 3-by-1 cluster that is 1. An unsafe budget is refused rather than
+    /// applied — see `PodDisruptionBudgetSpec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_disruption_budget: Option<PodDisruptionBudgetSpec>,
-}
 
-/// Mirrors `policy/v1` `PodDisruptionBudgetSpec` — the operator builds and
-/// owns the PDB, selecting on the cluster's pods. Exactly one of
-/// `minAvailable` / `maxUnavailable` should be set; if neither is, the PDB
-/// is left absent.
-#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct PodDisruptionBudgetSpec {
-    /// Integer or percentage (e.g. `1` or `"50%"`).
+    /// Overrides the operator's default pod spread.
+    ///
+    /// By default the cluster's pods get a single soft constraint — `maxSkew: 1`
+    /// over `kubernetes.io/hostname` with `whenUnsatisfiable: ScheduleAnyway` —
+    /// so the scheduler prefers to put every pod on a different node but still
+    /// schedules on clusters with fewer nodes than pods. This matters more here
+    /// than a PodDisruptionBudget does: a budget only rate-limits *voluntary*
+    /// eviction, so without spreading, losing one node can still take the whole
+    /// cluster down. Set to `[]` to emit no constraints at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_available: Option<IntOrString>,
-
-    /// Integer or percentage. Mutually exclusive with `minAvailable`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_unavailable: Option<IntOrString>,
-
-    /// `IfHealthyBudget` (default) or `AlwaysAllow`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unhealthy_pod_eviction_policy: Option<String>,
+    pub topology_spread_constraints: Option<Vec<TopologySpreadConstraint>>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
@@ -132,6 +129,48 @@ pub struct NodeStatus {
     pub replica_count: i32,
 }
 
+impl RedisClusterSpec {
+    /// Pods the StatefulSet runs: one per master, plus each master's replicas.
+    pub fn total_pods(&self) -> i32 {
+        total_pods(self.masters, self.replicas_per_master)
+    }
+
+    /// Pods that may be concurrently unavailable while the cluster keeps
+    /// serving all 16384 slots.
+    ///
+    /// The PDB selector matches every pod in the StatefulSet indiscriminately —
+    /// shard membership is decided at runtime by `redis-cli --cluster` and
+    /// appears in no pod label — so this bound has to hold even if every
+    /// eviction lands in the worst possible place. Two limits apply at once:
+    ///
+    /// - **Shard survival.** A shard is `1 + replicas_per_master` pods. If all
+    ///   of one shard is down its slots are unserved and `cluster_state` goes
+    ///   to `fail`, so at most `replicas_per_master` may go.
+    /// - **Master majority.** Redis Cluster needs a majority of masters to mark
+    ///   a node failed and authorise a promotion; a node that can't reach one
+    ///   stops serving. That allows `(masters - 1) / 2` down.
+    ///
+    /// Whichever is tighter wins. The majority bound is deliberately pessimistic
+    /// when replicas exist — an evicted master is failed over and the count
+    /// recovers — but the promotion itself needs the surviving majority to vote,
+    /// so the simultaneous bound is the correct one for a PDB.
+    ///
+    /// Returns 0 when the topology can't survive any voluntary disruption at
+    /// all (no replicas, or fewer than 3 masters).
+    pub fn safe_max_unavailable(&self) -> i32 {
+        let master_majority_slack = (self.masters - 1) / 2;
+        master_majority_slack.min(self.replicas_per_master).max(0)
+    }
+}
+
+/// Pod count for a cluster of `masters` shards each carrying
+/// `replicas_per_master` replicas. A free function as well as a method because
+/// several call sites hold the two counts directly rather than the whole spec,
+/// and this formula should have exactly one definition.
+pub fn total_pods(masters: i32, replicas_per_master: i32) -> i32 {
+    masters * (1 + replicas_per_master)
+}
+
 fn default_masters() -> i32 {
     3
 }
@@ -142,4 +181,59 @@ fn default_replicas_per_master() -> i32 {
 
 fn default_image() -> String {
     "redis:8".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(masters: i32, replicas_per_master: i32) -> RedisClusterSpec {
+        RedisClusterSpec {
+            masters,
+            replicas_per_master,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn total_pods_counts_masters_and_replicas() {
+        assert_eq!(spec(3, 1).total_pods(), 6);
+        assert_eq!(spec(3, 0).total_pods(), 3);
+        assert_eq!(spec(5, 2).total_pods(), 15);
+    }
+
+    #[test]
+    fn cluster_safe_bound_is_one_for_three_by_one() {
+        assert_eq!(spec(3, 1).safe_max_unavailable(), 1);
+    }
+
+    #[test]
+    fn cluster_safe_bound_is_zero_without_replicas() {
+        // No replica means evicting any master takes its slots offline.
+        assert_eq!(spec(3, 0).safe_max_unavailable(), 0);
+    }
+
+    #[test]
+    fn cluster_safe_bound_is_zero_below_three_masters() {
+        // 2 masters cannot form a majority after losing one.
+        assert_eq!(spec(2, 1).safe_max_unavailable(), 0);
+        assert_eq!(spec(1, 1).safe_max_unavailable(), 0);
+    }
+
+    #[test]
+    fn cluster_safe_bound_capped_by_master_majority() {
+        // 6 masters tolerate 2 down; the 3 replicas per shard are not the limit.
+        assert_eq!(spec(6, 3).safe_max_unavailable(), 2);
+    }
+
+    #[test]
+    fn cluster_safe_bound_capped_by_shard_replicas() {
+        // 9 masters would tolerate 4 down, but 1 replica per shard caps it at 1.
+        assert_eq!(spec(9, 1).safe_max_unavailable(), 1);
+    }
+
+    #[test]
+    fn cluster_safe_bound_scales_with_both() {
+        assert_eq!(spec(5, 2).safe_max_unavailable(), 2);
+    }
 }

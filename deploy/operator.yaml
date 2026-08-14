@@ -41,6 +41,11 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
+  # kube's event Recorder writes events.k8s.io/v1 Events, which the core-group
+  # rule above does not cover.
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -89,6 +94,12 @@ spec:
           env:
             - name: RUST_LOG
               value: info,kube=info
+            # Identifies this operator instance as the reporter on the Events
+            # it publishes.
+            - name: CONTROLLER_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           resources:
             requests:
               cpu: 50m

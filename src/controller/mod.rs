@@ -1,14 +1,21 @@
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::ResourceRequirements;
+use k8s_openapi::api::core::v1::{
+    ObjectReference, ResourceRequirements, TopologySpreadConstraint,
+};
+use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec as K8sPdbSpec};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use kube::api::{Patch, PatchParams};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use kube::api::{DeleteParams, ObjectMeta, Patch, PatchParams};
+use kube::runtime::events::{Event, EventType, Recorder, Reporter};
 use kube::{Api, Client, Resource};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tracing::{info, warn};
 
-use crate::crd::redis::ResourcesSpec;
+use crate::crd::redis::{PodDisruptionBudgetSpec, ResourcesSpec};
 use crate::error::Result;
 
 pub mod redis;
@@ -19,11 +26,36 @@ pub const FIELD_MANAGER: &str = "redis-operator";
 #[derive(Clone)]
 pub struct Context {
     pub client: Client,
+    pub recorder: Recorder,
 }
 
 impl Context {
     pub fn new(client: Client) -> Self {
-        Self { client }
+        let reporter = Reporter {
+            controller: FIELD_MANAGER.to_string(),
+            // Set from the downward API in deploy/operator.yaml. Naming the pod
+            // makes `kubectl describe` unambiguous if the operator is ever run
+            // with more than one replica.
+            instance: std::env::var("CONTROLLER_POD_NAME").ok(),
+        };
+        Self {
+            // Built once and shared: `Recorder` is `Clone` and its dedup cache
+            // is behind an `Arc`, which is what collapses a warning re-emitted
+            // on every reconcile into a single Event with a rising
+            // `series.count`. Constructing one per reconcile would defeat that
+            // and flood the events API.
+            recorder: Recorder::new(client.clone(), reporter),
+            client,
+        }
+    }
+}
+
+/// Publish an Event, downgrading failures to a log line. Event delivery is
+/// best-effort telemetry — a missing RBAC grant on `events.k8s.io` must not
+/// take the reconcile down with it.
+pub async fn emit(ctx: &Context, obj_ref: &ObjectReference, ev: Event) {
+    if let Err(err) = ctx.recorder.publish(&ev, obj_ref).await {
+        warn!(?err, reason = %ev.reason, "failed to publish event");
     }
 }
 
@@ -141,6 +173,294 @@ where
     Ok(())
 }
 
+/// Outcome of validating a user-supplied PDB against a workload's real
+/// disruption tolerance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PdbVerdict {
+    /// Requested disruption is within the safe bound.
+    Ok,
+    /// Workload is too small for a PDB to protect anything (fewer than 2 pods).
+    /// Applied as asked; the user is told it does nothing.
+    NotApplicable,
+    /// Neither `minAvailable` nor `maxUnavailable` set — nothing to apply.
+    Empty,
+    /// Both set. The API server rejects this outright, so refuse before it 422s.
+    BothSet,
+    /// Would permit more concurrent eviction than the workload survives.
+    Unsafe { requested: i32, allowed: i32 },
+    /// A value the operator cannot resolve — the API server would reject it too.
+    Unresolvable { field: &'static str, value: String },
+}
+
+impl PdbVerdict {
+    /// True when the spec should be sent to the API server.
+    pub fn should_apply(&self) -> bool {
+        matches!(self, PdbVerdict::Ok | PdbVerdict::NotApplicable)
+    }
+
+    /// Event reason. `None` for verdicts that warrant no Event.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            PdbVerdict::Ok | PdbVerdict::Empty => None,
+            PdbVerdict::NotApplicable => Some("IneffectivePodDisruptionBudget"),
+            PdbVerdict::BothSet | PdbVerdict::Unresolvable { .. } => {
+                Some("InvalidPodDisruptionBudget")
+            }
+            PdbVerdict::Unsafe { .. } => Some("UnsafePodDisruptionBudget"),
+        }
+    }
+
+    /// Human-readable note for the Event and the log line.
+    pub fn note(&self) -> Option<String> {
+        match self {
+            PdbVerdict::Ok | PdbVerdict::Empty => None,
+            PdbVerdict::NotApplicable => Some(
+                "podDisruptionBudget applied, but this workload has fewer than 2 pods \
+                 so the budget cannot protect anything"
+                    .to_string(),
+            ),
+            PdbVerdict::BothSet => Some(
+                "podDisruptionBudget sets both minAvailable and maxUnavailable, which \
+                 the API server rejects; leaving the PDB unchanged"
+                    .to_string(),
+            ),
+            PdbVerdict::Unresolvable { field, value } => Some(format!(
+                "podDisruptionBudget {field} value {value:?} is not a valid integer or \
+                 percentage; leaving the PDB unchanged"
+            )),
+            PdbVerdict::Unsafe { requested, allowed } => Some(format!(
+                "podDisruptionBudget permits {requested} concurrent disruption(s) but \
+                 this workload survives at most {allowed}; leaving the PDB unchanged"
+            )),
+        }
+    }
+}
+
+/// Resolve a PDB `IntOrString` against a known workload size, mirroring
+/// `intstr.GetScaledValueFromIntOrPercent(v, total, roundUp = true)` — the exact
+/// call the disruption controller makes for **both** `minAvailable` and
+/// `maxUnavailable`.
+///
+/// The rounding direction matters: rounding up makes a `minAvailable` percentage
+/// stricter but a `maxUnavailable` percentage *looser*, so rounding down here
+/// would under-report the disruption a budget permits and wave through unsafe
+/// configs. Returns `None` for anything the API server would reject (bare-number
+/// strings, a missing `%`, non-numeric, out of range).
+pub fn resolve_int_or_percent(v: &IntOrString, total: i32) -> Option<i32> {
+    match v {
+        IntOrString::Int(n) => Some(*n),
+        IntOrString::String(s) => {
+            let pct: i64 = s.trim().strip_suffix('%')?.trim().parse().ok()?;
+            if !(0..=100).contains(&pct) {
+                return None;
+            }
+            // Ceiling division, matching roundUp = true.
+            Some(((pct * total as i64 + 99) / 100) as i32)
+        }
+    }
+}
+
+/// Concurrent evictions a PDB spec permits over a workload of `total` pods,
+/// normalising both spec forms to a single number.
+pub fn pdb_effective_max_unavailable(
+    spec: &PodDisruptionBudgetSpec,
+    total: i32,
+) -> std::result::Result<i32, PdbVerdict> {
+    match (&spec.min_available, &spec.max_unavailable) {
+        (Some(_), Some(_)) => Err(PdbVerdict::BothSet),
+        (None, None) => Err(PdbVerdict::Empty),
+        (Some(min), None) => resolve_int_or_percent(min, total)
+            .map(|m| total - m)
+            .ok_or_else(|| PdbVerdict::Unresolvable {
+                field: "minAvailable",
+                value: int_or_string_display(min),
+            }),
+        (None, Some(max)) => {
+            resolve_int_or_percent(max, total).ok_or_else(|| PdbVerdict::Unresolvable {
+                field: "maxUnavailable",
+                value: int_or_string_display(max),
+            })
+        }
+    }
+}
+
+fn int_or_string_display(v: &IntOrString) -> String {
+    match v {
+        IntOrString::Int(n) => n.to_string(),
+        IntOrString::String(s) => s.clone(),
+    }
+}
+
+/// Compare the disruption a budget permits against what the workload survives.
+pub fn validate_pdb(spec: &PodDisruptionBudgetSpec, total: i32, safe: i32) -> PdbVerdict {
+    let requested = match pdb_effective_max_unavailable(spec, total) {
+        Ok(n) => n,
+        Err(verdict) => return verdict,
+    };
+    if total < 2 {
+        return PdbVerdict::NotApplicable;
+    }
+    if requested > safe {
+        return PdbVerdict::Unsafe {
+            requested,
+            allowed: safe,
+        };
+    }
+    PdbVerdict::Ok
+}
+
+/// Build a `policy/v1` PodDisruptionBudget selecting `labels`.
+pub fn build_pdb(
+    name: &str,
+    ns: &str,
+    labels: &BTreeMap<String, String>,
+    owner: OwnerReference,
+    spec: &PodDisruptionBudgetSpec,
+) -> PodDisruptionBudget {
+    PodDisruptionBudget {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(ns.to_string()),
+            labels: Some(labels.clone()),
+            owner_references: Some(vec![owner]),
+            ..Default::default()
+        },
+        spec: Some(K8sPdbSpec {
+            min_available: spec.min_available.clone(),
+            max_unavailable: spec.max_unavailable.clone(),
+            unhealthy_pod_eviction_policy: spec.unhealthy_pod_eviction_policy.clone(),
+            selector: Some(LabelSelector {
+                match_labels: Some(labels.clone()),
+                ..Default::default()
+            }),
+        }),
+        status: None,
+    }
+}
+
+/// Everything one PDB reconcile needs. A struct because the positional form
+/// would be eight arguments.
+pub struct PdbRequest<'a> {
+    /// Name of the PDB object; matches the StatefulSet it protects.
+    pub name: &'a str,
+    pub ns: &'a str,
+    /// Pod labels the PDB selects — must equal the StatefulSet's pod-template
+    /// labels.
+    pub labels: &'a BTreeMap<String, String>,
+    pub owner: OwnerReference,
+    /// The CR the Event is attached to, from `cr.object_ref(&())`.
+    pub obj_ref: &'a ObjectReference,
+    /// User spec, or the operator's default. `None` deletes any existing PDB.
+    pub desired: Option<PodDisruptionBudgetSpec>,
+    /// Pods the selector matches — the StatefulSet's `.spec.replicas`. This is
+    /// what the disruption controller uses as `expectedCount`, which is why
+    /// percentages can be resolved without reading live state.
+    pub total: i32,
+    /// Pods that may be concurrently unavailable without losing availability.
+    pub safe_max_unavailable: i32,
+}
+
+/// Validate a desired PDB, then apply it, skip it, or delete it.
+///
+/// Never returns `Err` for a bad user budget — only for genuine API failures —
+/// so one malformed budget cannot wedge the rest of the reconcile.
+///
+/// On a refusal the existing PDB is deliberately left in place rather than
+/// deleted: the only PDBs the operator ever applies are validated ones, so
+/// whatever is live is either absent or previously safe, and tearing it down
+/// would strip protection at exactly the moment the user's config broke. A PDB
+/// is deleted only when `desired` is `None` — the field was removed, or the
+/// workload it protected is gone.
+pub async fn reconcile_pdb(
+    api: &Api<PodDisruptionBudget>,
+    ctx: &Context,
+    req: PdbRequest<'_>,
+) -> Result<PdbVerdict> {
+    // `None` (field removed, workload gone) and a spec that sets neither field
+    // both mean "no budget wanted". Deleting outright — rather than leaving it
+    // to owner-reference GC — makes toggling the field off take effect at once.
+    let verdict = match &req.desired {
+        Some(spec) => validate_pdb(spec, req.total, req.safe_max_unavailable),
+        None => PdbVerdict::Empty,
+    };
+    if verdict == PdbVerdict::Empty {
+        return match api.delete(req.name, &DeleteParams::default()).await {
+            Ok(_) => Ok(PdbVerdict::Empty),
+            Err(kube::Error::Api(e)) if e.code == 404 => Ok(PdbVerdict::Empty),
+            Err(e) => Err(e.into()),
+        };
+    }
+    let spec = req.desired.as_ref().expect("Empty covers the None case");
+
+    if let (Some(reason), Some(note)) = (verdict.reason(), verdict.note()) {
+        let type_ = if matches!(verdict, PdbVerdict::NotApplicable) {
+            EventType::Normal
+        } else {
+            EventType::Warning
+        };
+        if type_ == EventType::Warning {
+            warn!(pdb = %req.name, %note, "refusing pod disruption budget");
+        } else {
+            info!(pdb = %req.name, %note);
+        }
+        emit(
+            ctx,
+            req.obj_ref,
+            Event {
+                type_,
+                reason: reason.to_string(),
+                note: Some(note),
+                action: "ReconcilePodDisruptionBudget".to_string(),
+                secondary: None,
+            },
+        )
+        .await;
+    }
+
+    if verdict.should_apply() {
+        let pdb = build_pdb(req.name, req.ns, req.labels, req.owner, spec);
+        apply(api, req.name, &pdb).await?;
+    }
+
+    Ok(verdict)
+}
+
+/// Default soft spread for a workload: one constraint, `maxSkew` 1 across
+/// hostnames, selecting the workload's own pods.
+///
+/// `ScheduleAnyway` on purpose — `DoNotSchedule` would leave pods Pending
+/// forever on kind/minikube/CI and on any cluster with fewer nodes than
+/// replicas. Users who want a hard guarantee override the field.
+pub fn default_topology_spread(labels: &BTreeMap<String, String>) -> Vec<TopologySpreadConstraint> {
+    vec![TopologySpreadConstraint {
+        max_skew: 1,
+        topology_key: "kubernetes.io/hostname".to_string(),
+        when_unsatisfiable: "ScheduleAnyway".to_string(),
+        label_selector: Some(LabelSelector {
+            match_labels: Some(labels.clone()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }]
+}
+
+/// `None` -> operator default; `Some([])` -> explicit opt-out; `Some(v)` -> the
+/// user's list verbatim.
+///
+/// The empty-vec case maps to `None` rather than an empty list: both are
+/// equivalent to the scheduler, but only omitting the field releases the
+/// operator's server-side-apply ownership of it cleanly.
+pub fn effective_topology_spread(
+    user: Option<&Vec<TopologySpreadConstraint>>,
+    labels: &BTreeMap<String, String>,
+) -> Option<Vec<TopologySpreadConstraint>> {
+    match user {
+        None => Some(default_topology_spread(labels)),
+        Some(v) if v.is_empty() => None,
+        Some(v) => Some(v.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +525,267 @@ mod tests {
         assert_eq!(req.get("memory").unwrap().0, "1Gi");
         assert_eq!(lim.get("cpu").unwrap().0, "1");
         assert_eq!(lim.get("memory").unwrap().0, "1Gi");
+    }
+
+    fn pct(s: &str) -> IntOrString {
+        IntOrString::String(s.to_string())
+    }
+
+    fn min_available(v: IntOrString) -> PodDisruptionBudgetSpec {
+        PodDisruptionBudgetSpec {
+            min_available: Some(v),
+            ..Default::default()
+        }
+    }
+
+    fn max_unavailable(v: IntOrString) -> PodDisruptionBudgetSpec {
+        PodDisruptionBudgetSpec {
+            max_unavailable: Some(v),
+            ..Default::default()
+        }
+    }
+
+    fn test_labels() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("app.kubernetes.io/name".to_string(), "redis".to_string()),
+            ("app.kubernetes.io/instance".to_string(), "cache".to_string()),
+        ])
+    }
+
+    #[test]
+    fn resolve_percent_rounds_up_like_apiserver() {
+        assert_eq!(resolve_int_or_percent(&pct("50%"), 3), Some(2));
+        assert_eq!(resolve_int_or_percent(&pct("50%"), 5), Some(3));
+        assert_eq!(resolve_int_or_percent(&pct("34%"), 3), Some(2));
+    }
+
+    #[test]
+    fn resolve_percent_handles_bounds() {
+        assert_eq!(resolve_int_or_percent(&pct("0%"), 6), Some(0));
+        assert_eq!(resolve_int_or_percent(&pct("100%"), 6), Some(6));
+    }
+
+    #[test]
+    fn resolve_int_passes_through_unscaled() {
+        assert_eq!(resolve_int_or_percent(&IntOrString::Int(2), 6), Some(2));
+    }
+
+    #[test]
+    fn resolve_rejects_bare_number_string() {
+        assert_eq!(resolve_int_or_percent(&pct("3"), 6), None);
+    }
+
+    #[test]
+    fn resolve_rejects_garbage() {
+        for s in ["abc", "", "%", "-10%", "150%"] {
+            assert_eq!(resolve_int_or_percent(&pct(s), 6), None, "input {s:?}");
+        }
+    }
+
+    #[test]
+    fn effective_max_unavailable_from_min_available() {
+        let spec = min_available(IntOrString::Int(5));
+        assert_eq!(pdb_effective_max_unavailable(&spec, 6), Ok(1));
+    }
+
+    #[test]
+    fn effective_max_unavailable_from_min_available_percent() {
+        // 50% of 5 rounds up to 3, leaving 2 disruptable.
+        let spec = min_available(pct("50%"));
+        assert_eq!(pdb_effective_max_unavailable(&spec, 5), Ok(2));
+    }
+
+    #[test]
+    fn effective_max_unavailable_from_max_unavailable_percent() {
+        // Rounds UP to 3, not down to 2 — rounding down here would under-report
+        // the disruption permitted and wave through unsafe budgets.
+        let spec = max_unavailable(pct("50%"));
+        assert_eq!(pdb_effective_max_unavailable(&spec, 5), Ok(3));
+    }
+
+    #[test]
+    fn effective_max_unavailable_rejects_both_set() {
+        let spec = PodDisruptionBudgetSpec {
+            min_available: Some(IntOrString::Int(2)),
+            max_unavailable: Some(IntOrString::Int(1)),
+            ..Default::default()
+        };
+        assert_eq!(
+            pdb_effective_max_unavailable(&spec, 6),
+            Err(PdbVerdict::BothSet)
+        );
+    }
+
+    #[test]
+    fn effective_max_unavailable_rejects_neither_set() {
+        let spec = PodDisruptionBudgetSpec::default();
+        assert_eq!(
+            pdb_effective_max_unavailable(&spec, 6),
+            Err(PdbVerdict::Empty)
+        );
+    }
+
+    #[test]
+    fn validate_pdb_accepts_at_the_bound() {
+        let spec = max_unavailable(IntOrString::Int(1));
+        assert_eq!(validate_pdb(&spec, 6, 1), PdbVerdict::Ok);
+    }
+
+    #[test]
+    fn validate_pdb_rejects_above_the_bound() {
+        let spec = max_unavailable(IntOrString::Int(2));
+        assert_eq!(
+            validate_pdb(&spec, 6, 1),
+            PdbVerdict::Unsafe {
+                requested: 2,
+                allowed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn validate_pdb_accepts_min_available_at_the_bound() {
+        let spec = min_available(IntOrString::Int(5));
+        assert_eq!(validate_pdb(&spec, 6, 1), PdbVerdict::Ok);
+    }
+
+    #[test]
+    fn validate_pdb_rejects_min_available_below_the_bound() {
+        let spec = min_available(IntOrString::Int(3));
+        assert_eq!(
+            validate_pdb(&spec, 6, 1),
+            PdbVerdict::Unsafe {
+                requested: 3,
+                allowed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn validate_pdb_rejects_zero_bound_workload() {
+        let spec = max_unavailable(IntOrString::Int(1));
+        assert_eq!(
+            validate_pdb(&spec, 3, 0),
+            PdbVerdict::Unsafe {
+                requested: 1,
+                allowed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn validate_pdb_rejects_unresolvable_percentage() {
+        let spec = max_unavailable(pct("abc"));
+        assert_eq!(
+            validate_pdb(&spec, 6, 1),
+            PdbVerdict::Unresolvable {
+                field: "maxUnavailable",
+                value: "abc".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn validate_pdb_not_applicable_for_single_pod_workload() {
+        let spec = max_unavailable(IntOrString::Int(1));
+        assert_eq!(validate_pdb(&spec, 1, 0), PdbVerdict::NotApplicable);
+    }
+
+    #[test]
+    fn only_ok_and_not_applicable_are_applied() {
+        assert!(PdbVerdict::Ok.should_apply());
+        assert!(PdbVerdict::NotApplicable.should_apply());
+        assert!(!PdbVerdict::Empty.should_apply());
+        assert!(!PdbVerdict::BothSet.should_apply());
+        assert!(
+            !PdbVerdict::Unsafe {
+                requested: 2,
+                allowed: 1
+            }
+            .should_apply()
+        );
+    }
+
+    #[test]
+    fn build_pdb_selects_the_workload_labels() {
+        let l = test_labels();
+        let spec = max_unavailable(IntOrString::Int(1));
+        let pdb = build_pdb("cache", "ns", &l, OwnerReference::default(), &spec);
+        let selector = pdb.spec.unwrap().selector.unwrap();
+        assert_eq!(selector.match_labels.unwrap(), l);
+    }
+
+    #[test]
+    fn build_pdb_sets_owner_reference() {
+        let spec = max_unavailable(IntOrString::Int(1));
+        let owner = OwnerReference {
+            name: "cache".to_string(),
+            ..Default::default()
+        };
+        let pdb = build_pdb("cache", "ns", &test_labels(), owner, &spec);
+        let refs = pdb.metadata.owner_references.unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].name, "cache");
+        assert_eq!(pdb.metadata.namespace.unwrap(), "ns");
+    }
+
+    #[test]
+    fn build_pdb_passes_through_unhealthy_pod_eviction_policy() {
+        let spec = PodDisruptionBudgetSpec {
+            min_available: Some(IntOrString::Int(2)),
+            unhealthy_pod_eviction_policy: Some("AlwaysAllow".to_string()),
+            ..Default::default()
+        };
+        let pdb = build_pdb("cache", "ns", &test_labels(), OwnerReference::default(), &spec);
+        assert_eq!(
+            pdb.spec.unwrap().unhealthy_pod_eviction_policy.unwrap(),
+            "AlwaysAllow"
+        );
+    }
+
+    #[test]
+    fn default_topology_spread_is_soft_hostname_skew_one() {
+        let c = default_topology_spread(&test_labels());
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].max_skew, 1);
+        assert_eq!(c[0].topology_key, "kubernetes.io/hostname");
+        // Must stay soft: DoNotSchedule would leave pods Pending on any cluster
+        // with fewer nodes than replicas.
+        assert_eq!(c[0].when_unsatisfiable, "ScheduleAnyway");
+    }
+
+    #[test]
+    fn default_topology_spread_selector_matches_workload_labels() {
+        let l = test_labels();
+        let c = default_topology_spread(&l);
+        assert_eq!(c[0].label_selector.clone().unwrap().match_labels.unwrap(), l);
+    }
+
+    #[test]
+    fn effective_topology_spread_none_yields_default() {
+        let l = test_labels();
+        assert_eq!(
+            effective_topology_spread(None, &l),
+            Some(default_topology_spread(&l))
+        );
+    }
+
+    #[test]
+    fn effective_topology_spread_empty_vec_opts_out() {
+        assert_eq!(effective_topology_spread(Some(&vec![]), &test_labels()), None);
+    }
+
+    #[test]
+    fn effective_topology_spread_user_override_wins_verbatim() {
+        let user = vec![TopologySpreadConstraint {
+            max_skew: 2,
+            topology_key: "topology.kubernetes.io/zone".to_string(),
+            when_unsatisfiable: "DoNotSchedule".to_string(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            effective_topology_spread(Some(&user), &test_labels()),
+            Some(user.clone())
+        );
     }
 }

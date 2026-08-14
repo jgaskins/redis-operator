@@ -11,20 +11,25 @@ use k8s_openapi::api::core::v1::{
     PersistentVolumeClaimSpec, Pod, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
     Service, ServicePort, ServiceSpec, Volume, VolumeMount, VolumeResourceRequirements,
 };
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{AttachParams, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams};
 use kube::runtime::controller::Action;
+use kube::runtime::events::{Event, EventType};
 use kube::runtime::{Controller, watcher};
 use kube::{Api, Client, Resource, ResourceExt};
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tracing::{info, warn};
 
-use crate::controller::{Context, FIELD_MANAGER, apply, effective_redis_resources, maxmemory_bytes};
+use crate::controller::{
+    Context, FIELD_MANAGER, PdbRequest, PdbVerdict, apply, effective_redis_resources,
+    effective_topology_spread, emit, maxmemory_bytes, reconcile_pdb,
+};
 use crate::crd::Redis;
-use crate::crd::redis::{ResourcesSpec, SentinelSpec};
+use crate::crd::redis::{PodDisruptionBudgetSpec, RedisSpec, ResourcesSpec, SentinelSpec};
 use crate::error::{Error, Result};
 
 const REDIS_PORT: i32 = 6379;
@@ -49,12 +54,14 @@ pub async fn run(ctx: Arc<Context>) -> anyhow::Result<()> {
 
     let sts_api: Api<StatefulSet> = Api::all(ctx.client.clone());
     let svc_api: Api<Service> = Api::all(ctx.client.clone());
+    let pdb_api: Api<PodDisruptionBudget> = Api::all(ctx.client.clone());
 
     info!("starting Redis controller");
 
     Controller::new(redis_api, watcher::Config::default())
         .owns(sts_api, watcher::Config::default())
         .owns(svc_api, watcher::Config::default())
+        .owns(pdb_api, watcher::Config::default())
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx)
         .for_each(|res| async move {
@@ -81,7 +88,9 @@ async fn reconcile(redis: Arc<Redis>, ctx: Arc<Context>) -> Result<Action> {
 
     let svc_api: Api<Service> = Api::namespaced(ctx.client.clone(), &ns);
     let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), &ns);
+    let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(ctx.client.clone(), &ns);
     let redis_api: Api<Redis> = Api::namespaced(ctx.client.clone(), &ns);
+    let obj_ref = redis.object_ref(&());
 
     apply(&svc_api, &name, &build_headless_service(&redis, &ns, owner.clone())).await?;
     apply(&sts_api, &name, &build_redis_statefulset(&redis, &ns, owner.clone())).await?;
@@ -92,7 +101,30 @@ async fn reconcile(redis: Arc<Redis>, ctx: Arc<Context>) -> Result<Action> {
     )
     .await?;
 
+    // After the StatefulSet, never before: a rejected budget must not be able to
+    // stop the workload itself from reconciling.
+    let data_verdict = reconcile_pdb(
+        &pdb_api,
+        &ctx,
+        PdbRequest {
+            name: &name,
+            ns: &ns,
+            labels: &labels(&name),
+            owner: owner.clone(),
+            obj_ref: &obj_ref,
+            desired: redis
+                .spec
+                .pod_disruption_budget
+                .clone()
+                .or_else(|| default_redis_pdb(&redis.spec)),
+            total: redis.spec.replicas,
+            safe_max_unavailable: redis.spec.safe_max_unavailable(),
+        },
+    )
+    .await?;
+
     let sentinel_name = sentinel_sts_name(&name);
+    let mut sentinel_verdict = PdbVerdict::Empty;
     if let Some(sentinel_spec) = redis.spec.sentinel.as_ref() {
         apply(
             &svc_api,
@@ -106,9 +138,54 @@ async fn reconcile(redis: Arc<Redis>, ctx: Arc<Context>) -> Result<Action> {
             &build_sentinel_statefulset(&redis, &ns, sentinel_spec, owner.clone()),
         )
         .await?;
+
+        if sentinel_spec.pod_disruption_budget.is_none() && sentinel_spec.replicas < 3 {
+            warn!(
+                replicas = sentinel_spec.replicas,
+                "sentinel has fewer than 3 replicas; skipping the automatic PDB"
+            );
+            emit(
+                &ctx,
+                &obj_ref,
+                Event {
+                    type_: EventType::Warning,
+                    reason: "SentinelNotHighlyAvailable".to_string(),
+                    note: Some(format!(
+                        "sentinel.replicas is {}; failover needs at least 3 to survive \
+                         losing one sentinel. No PodDisruptionBudget was created, because \
+                         minAvailable would equal the replica count and block every node \
+                         drain.",
+                        sentinel_spec.replicas
+                    )),
+                    action: "ReconcilePodDisruptionBudget".to_string(),
+                    secondary: None,
+                },
+            )
+            .await;
+        }
+
+        sentinel_verdict = reconcile_pdb(
+            &pdb_api,
+            &ctx,
+            PdbRequest {
+                name: &sentinel_name,
+                ns: &ns,
+                labels: &sentinel_labels(&name),
+                owner: owner.clone(),
+                obj_ref: &obj_ref,
+                desired: sentinel_spec
+                    .pod_disruption_budget
+                    .clone()
+                    .or_else(|| default_sentinel_pdb(sentinel_spec)),
+                total: sentinel_spec.replicas,
+                safe_max_unavailable: sentinel_spec.safe_max_unavailable(),
+            },
+        )
+        .await?;
     } else {
         delete_if_exists(svc_api.delete(&sentinel_name, &DeleteParams::default()).await)?;
         delete_if_exists(sts_api.delete(&sentinel_name, &DeleteParams::default()).await)?;
+        delete_if_exists(pdb_api.delete(&sentinel_name, &DeleteParams::default()).await)?;
     }
 
     let master_pod =
@@ -129,7 +206,14 @@ async fn reconcile(redis: Arc<Redis>, ctx: Arc<Context>) -> Result<Action> {
         .and_then(|s| s.status)
         .and_then(|s| s.ready_replicas)
         .unwrap_or(0);
-    let phase = if ready == redis.spec.replicas && redis.spec.replicas > 0 {
+    // A refused budget means the workload is running without the protection the
+    // user asked for, so it is not `Running` even when every pod is ready.
+    let pdb_refused = [&data_verdict, &sentinel_verdict]
+        .iter()
+        .any(|v| !v.should_apply() && **v != PdbVerdict::Empty);
+    let phase = if pdb_refused {
+        "Degraded"
+    } else if ready == redis.spec.replicas && redis.spec.replicas > 0 {
         "Running"
     } else {
         "Pending"
@@ -196,6 +280,57 @@ fn labels(name: &str) -> BTreeMap<String, String> {
     m.insert("app.kubernetes.io/instance".into(), name.to_string());
     m.insert("app.kubernetes.io/managed-by".into(), FIELD_MANAGER.into());
     m
+}
+
+/// The PDB the operator creates for the Redis data pods when the user hasn't
+/// specified one: at most one pod disrupted at a time.
+///
+/// `maxUnavailable: 1` rather than the theoretical maximum of `replicas - 1`.
+/// The bound in `RedisSpec::safe_max_unavailable` is what still leaves the data
+/// *readable*; one at a time is what keeps the workload actually usable through
+/// a drain, and it matches Sentinel's `parallel-syncs 1` so failovers stay
+/// serialised. Users who want the looser bound can set it explicitly.
+///
+/// Returns `None` below 2 replicas, where a budget has nothing to protect.
+///
+/// `AlwaysAllow` for the same reason as Sentinel's — see `default_sentinel_pdb`.
+/// It stays safe here: unhealthy pods become evictable, but healthy ones are
+/// still held to `maxUnavailable`, so the last surviving copy of the data can't
+/// be drained away.
+fn default_redis_pdb(spec: &RedisSpec) -> Option<PodDisruptionBudgetSpec> {
+    if spec.replicas < 2 {
+        return None;
+    }
+    Some(PodDisruptionBudgetSpec {
+        min_available: None,
+        max_unavailable: Some(IntOrString::Int(1)),
+        unhealthy_pod_eviction_policy: Some("AlwaysAllow".to_string()),
+    })
+}
+
+/// The PDB the operator creates for Sentinel when the user hasn't specified
+/// one. Sentinel is the component whose loss silently disables failover, so
+/// like the data-pod budget this one is opt-out rather than opt-in.
+///
+/// Returns `None` below 3 replicas: `minAvailable` would equal the replica
+/// count, permanently blocking every node drain in the namespace to protect a
+/// sentinel set that has no failure tolerance to begin with.
+///
+/// `AlwaysAllow` is deliberate. Under the `IfHealthyBudget` default, a sentinel
+/// that is already unready — sitting in TILT, the exact condition the readiness
+/// probe is tuned to catch — cannot be evicted once the budget is spent, which
+/// turns a routine node drain into a stuck one during the very incident being
+/// drained for. An unready sentinel contributes nothing to quorum, so letting it
+/// go is strictly better.
+fn default_sentinel_pdb(sentinel: &SentinelSpec) -> Option<PodDisruptionBudgetSpec> {
+    if sentinel.replicas < 3 {
+        return None;
+    }
+    Some(PodDisruptionBudgetSpec {
+        min_available: Some(IntOrString::Int(sentinel.min_available())),
+        max_unavailable: None,
+        unhealthy_pod_eviction_policy: Some("AlwaysAllow".to_string()),
+    })
 }
 
 fn sentinel_labels(name: &str) -> BTreeMap<String, String> {
@@ -496,6 +631,7 @@ fn build_redis_statefulset(redis: &Redis, ns: &str, owner: OwnerReference) -> St
     });
 
     let args = build_redis_args(redis, ns);
+    let spread = effective_topology_spread(redis.spec.topology_spread_constraints.as_ref(), &l);
 
     StatefulSet {
         metadata: ObjectMeta {
@@ -538,9 +674,15 @@ fn build_redis_statefulset(redis: &Redis, ns: &str, owner: OwnerReference) -> St
                         volume_mounts,
                         ..Default::default()
                     }],
+                    topology_spread_constraints: spread,
                     ..Default::default()
                 }),
             },
+            // Paces the rolling update so Sentinel has time to complete a
+            // failover before the next pod goes down. Lives on the spec rather
+            // than the template, so it is outside the controller-revision hash
+            // and does not itself trigger a roll.
+            min_ready_seconds: Some(10),
             volume_claim_templates,
             persistent_volume_claim_retention_policy: redis
                 .spec
@@ -652,6 +794,9 @@ fn build_sentinel_statefulset(
         .clone()
         .unwrap_or_else(|| redis.spec.image.clone());
     let args = build_sentinel_args(redis, ns, sentinel);
+    // Selects only the sentinel pods, so sentinels and data pods spread
+    // independently rather than sharing one skew domain.
+    let spread = effective_topology_spread(sentinel.topology_spread_constraints.as_ref(), &l);
 
     let ping = ExecAction {
         command: Some(vec![
@@ -776,9 +921,11 @@ fn build_sentinel_statefulset(
                         ..Default::default()
                     }],
                     volumes: pod_volumes,
+                    topology_spread_constraints: spread,
                     ..Default::default()
                 }),
             },
+            min_ready_seconds: Some(10),
             volume_claim_templates,
             persistent_volume_claim_retention_policy: retention,
             ..Default::default()
@@ -978,6 +1125,7 @@ async fn pod_exec(client: &Client, ns: &str, pod: &str, cmd: &[&str]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crd::redis::RedisSpec;
 
     #[test]
     fn parse_connected_slaves_extracts_count() {
@@ -1063,5 +1211,169 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(s.effective_quorum(), 4);
+    }
+
+    #[test]
+    fn redis_statefulset_gets_default_topology_spread() {
+        let redis = Redis::new(
+            "cache",
+            RedisSpec {
+                replicas: 3,
+                ..Default::default()
+            },
+        );
+        let sts = build_redis_statefulset(&redis, "ns", OwnerReference::default());
+        let c = sts
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .topology_spread_constraints
+            .expect("expected a default spread constraint");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].topology_key, "kubernetes.io/hostname");
+        assert_eq!(c[0].when_unsatisfiable, "ScheduleAnyway");
+        assert_eq!(
+            c[0].label_selector.clone().unwrap().match_labels.unwrap(),
+            labels("cache")
+        );
+    }
+
+    #[test]
+    fn redis_statefulset_omits_spread_when_opted_out() {
+        let redis = Redis::new(
+            "cache",
+            RedisSpec {
+                replicas: 3,
+                topology_spread_constraints: Some(vec![]),
+                ..Default::default()
+            },
+        );
+        let sts = build_redis_statefulset(&redis, "ns", OwnerReference::default());
+        assert!(
+            sts.spec
+                .unwrap()
+                .template
+                .spec
+                .unwrap()
+                .topology_spread_constraints
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sentinel_statefulset_spread_selects_sentinel_labels() {
+        let sentinel = SentinelSpec {
+            replicas: 3,
+            ..Default::default()
+        };
+        let redis = Redis::new(
+            "cache",
+            RedisSpec {
+                replicas: 3,
+                sentinel: Some(sentinel.clone()),
+                ..Default::default()
+            },
+        );
+        let sts = build_sentinel_statefulset(&redis, "ns", &sentinel, OwnerReference::default());
+        let c = sts
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .topology_spread_constraints
+            .expect("expected a default spread constraint");
+        // Must be the sentinel label set, not the data-pod one — sharing it
+        // would silently merge the two spread domains.
+        assert_eq!(
+            c[0].label_selector.clone().unwrap().match_labels.unwrap(),
+            sentinel_labels("cache")
+        );
+        assert_ne!(sentinel_labels("cache"), labels("cache"));
+    }
+
+    #[test]
+    fn default_redis_pdb_allows_one_pod_at_a_time() {
+        let spec = RedisSpec {
+            replicas: 3,
+            ..Default::default()
+        };
+        let pdb = default_redis_pdb(&spec).expect("expected an automatic PDB");
+        assert_eq!(pdb.max_unavailable, Some(IntOrString::Int(1)));
+        assert_eq!(pdb.min_available, None);
+        assert_eq!(
+            pdb.unhealthy_pod_eviction_policy.as_deref(),
+            Some("AlwaysAllow")
+        );
+    }
+
+    #[test]
+    fn default_redis_pdb_is_skipped_below_two_replicas() {
+        let spec = RedisSpec {
+            replicas: 1,
+            ..Default::default()
+        };
+        assert!(default_redis_pdb(&spec).is_none());
+    }
+
+    #[test]
+    fn default_redis_pdb_is_within_the_safe_bound() {
+        // The generated default must never be one the validator would refuse.
+        for replicas in 2..=9 {
+            let spec = RedisSpec {
+                replicas,
+                ..Default::default()
+            };
+            let pdb = default_redis_pdb(&spec).expect("expected an automatic PDB");
+            assert_eq!(
+                crate::controller::validate_pdb(&pdb, replicas, spec.safe_max_unavailable()),
+                crate::controller::PdbVerdict::Ok,
+                "replicas {replicas}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_sentinel_pdb_is_within_the_safe_bound() {
+        for replicas in 3..=9 {
+            let s = SentinelSpec {
+                replicas,
+                ..Default::default()
+            };
+            let pdb = default_sentinel_pdb(&s).expect("expected an automatic PDB");
+            assert_eq!(
+                crate::controller::validate_pdb(&pdb, replicas, s.safe_max_unavailable()),
+                crate::controller::PdbVerdict::Ok,
+                "replicas {replicas}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_sentinel_pdb_is_skipped_below_three_replicas() {
+        for replicas in [1, 2] {
+            let s = SentinelSpec {
+                replicas,
+                ..Default::default()
+            };
+            assert!(default_sentinel_pdb(&s).is_none(), "replicas {replicas}");
+        }
+    }
+
+    #[test]
+    fn default_sentinel_pdb_uses_quorum_and_always_allow() {
+        let s = SentinelSpec {
+            replicas: 3,
+            ..Default::default()
+        };
+        let pdb = default_sentinel_pdb(&s).expect("expected an automatic PDB");
+        assert_eq!(pdb.min_available, Some(IntOrString::Int(2)));
+        assert_eq!(pdb.max_unavailable, None);
+        assert_eq!(
+            pdb.unhealthy_pod_eviction_policy.as_deref(),
+            Some("AlwaysAllow")
+        );
     }
 }

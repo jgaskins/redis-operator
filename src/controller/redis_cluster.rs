@@ -11,13 +11,11 @@ use k8s_openapi::api::core::v1::{
     Pod, PodSpec, PodTemplateSpec, Probe, Service, ServicePort, ServiceSpec, VolumeMount,
     VolumeResourceRequirements,
 };
-use k8s_openapi::api::policy::v1::{
-    PodDisruptionBudget, PodDisruptionBudgetSpec as K8sPodDisruptionBudgetSpec,
-};
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{AttachParams, DeleteParams, ObjectMeta, Patch, PatchParams};
+use kube::api::{AttachParams, ObjectMeta, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::{Controller, watcher};
 use kube::{Api, Client, Resource, ResourceExt};
@@ -25,9 +23,12 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tracing::{info, warn};
 
-use crate::controller::{Context, FIELD_MANAGER, apply, effective_redis_resources, maxmemory_bytes};
+use crate::controller::{
+    Context, FIELD_MANAGER, PdbRequest, PdbVerdict, apply, effective_redis_resources,
+    effective_topology_spread, maxmemory_bytes, reconcile_pdb,
+};
 use crate::crd::RedisCluster;
-use crate::crd::redis_cluster::{NodeStatus, RedisClusterStatus};
+use crate::crd::redis_cluster::{NodeStatus, RedisClusterStatus, total_pods};
 use crate::error::{Error, Result};
 
 const TOTAL_SLOTS: i32 = 16384;
@@ -81,9 +82,8 @@ async fn reconcile(rc: Arc<RedisCluster>, ctx: Arc<Context>) -> Result<Action> {
     let rc_api: Api<RedisCluster> = Api::namespaced(ctx.client.clone(), &ns);
 
     apply(&svc_api, &name, &build_service(&rc, &ns, owner.clone())).await?;
-    reconcile_pdb(&pdb_api, &rc, &ns, owner.clone()).await?;
 
-    let total = rc.spec.masters * (1 + rc.spec.replicas_per_master);
+    let total = rc.spec.total_pods();
 
     let current_replicas = sts_api
         .get_opt(&name)
@@ -101,7 +101,31 @@ async fn reconcile(rc: Arc<RedisCluster>, ctx: Arc<Context>) -> Result<Action> {
         drain_for_scale_down(&ctx.client, &ns, &name, total, current_replicas).await?;
     }
 
-    apply(&sts_api, &name, &build_statefulset(&rc, &ns, owner)).await?;
+    apply(&sts_api, &name, &build_statefulset(&rc, &ns, owner.clone())).await?;
+
+    // After the StatefulSet, never before: a rejected budget must not be able to
+    // stop the workload itself from reconciling.
+    let obj_ref = rc.object_ref(&());
+    let pdb_verdict = reconcile_pdb(
+        &pdb_api,
+        &ctx,
+        PdbRequest {
+            name: &name,
+            ns: &ns,
+            labels: &labels(&name),
+            owner,
+            obj_ref: &obj_ref,
+            desired: rc.spec.pod_disruption_budget.clone(),
+            total,
+            safe_max_unavailable: rc.spec.safe_max_unavailable(),
+        },
+    )
+    .await?;
+
+    if !pdb_verdict.should_apply() && pdb_verdict != PdbVerdict::Empty {
+        set_phase(&rc_api, &name, "Degraded").await?;
+        return Ok(Action::requeue(Duration::from_secs(60)));
+    }
 
     let ready = sts_api
         .get_opt(&name)
@@ -287,64 +311,10 @@ fn build_service(rc: &RedisCluster, ns: &str, owner: OwnerReference) -> Service 
     }
 }
 
-/// Apply the PDB if `spec.podDisruptionBudget` is set; otherwise delete an
-/// existing one we previously owned. Deleting on absence (rather than relying
-/// on owner-ref GC) means toggling the field off cleans up immediately.
-async fn reconcile_pdb(
-    api: &Api<PodDisruptionBudget>,
-    rc: &RedisCluster,
-    ns: &str,
-    owner: OwnerReference,
-) -> Result<()> {
-    let name = rc.name_any();
-    match build_pod_disruption_budget(rc, ns, owner) {
-        Some(pdb) => apply(api, &name, &pdb).await,
-        None => match api.delete(&name, &DeleteParams::default()).await {
-            Ok(_) => Ok(()),
-            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
-            Err(e) => Err(e.into()),
-        },
-    }
-}
-
-fn build_pod_disruption_budget(
-    rc: &RedisCluster,
-    ns: &str,
-    owner: OwnerReference,
-) -> Option<PodDisruptionBudget> {
-    let pdb = rc.spec.pod_disruption_budget.as_ref()?;
-    // PDB requires exactly one of the two; if neither is set, skip rather
-    // than letting the API server reject a malformed object.
-    if pdb.min_available.is_none() && pdb.max_unavailable.is_none() {
-        return None;
-    }
-    let name = rc.name_any();
-    let l = labels(&name);
-    Some(PodDisruptionBudget {
-        metadata: ObjectMeta {
-            name: Some(name),
-            namespace: Some(ns.to_string()),
-            labels: Some(l.clone()),
-            owner_references: Some(vec![owner]),
-            ..Default::default()
-        },
-        spec: Some(K8sPodDisruptionBudgetSpec {
-            min_available: pdb.min_available.clone(),
-            max_unavailable: pdb.max_unavailable.clone(),
-            unhealthy_pod_eviction_policy: pdb.unhealthy_pod_eviction_policy.clone(),
-            selector: Some(LabelSelector {
-                match_labels: Some(l),
-                ..Default::default()
-            }),
-        }),
-        status: None,
-    })
-}
-
 fn build_statefulset(rc: &RedisCluster, ns: &str, owner: OwnerReference) -> StatefulSet {
     let name = rc.name_any();
     let l = labels(&name);
-    let replicas = rc.spec.masters * (1 + rc.spec.replicas_per_master);
+    let replicas = rc.spec.total_pods();
 
     let (volume_mounts, volume_claim_templates) = match &rc.spec.storage {
         Some(s) => {
@@ -390,6 +360,7 @@ fn build_statefulset(rc: &RedisCluster, ns: &str, owner: OwnerReference) -> Stat
     let maxmem = maxmemory_bytes(&resources)
         .map(|b| format!(" --maxmemory {b}"))
         .unwrap_or_default();
+    let spread = effective_topology_spread(rc.spec.topology_spread_constraints.as_ref(), &l);
 
     StatefulSet {
         metadata: ObjectMeta {
@@ -454,9 +425,14 @@ fn build_statefulset(rc: &RedisCluster, ns: &str, owner: OwnerReference) -> Stat
                         volume_mounts,
                         ..Default::default()
                     }],
+                    topology_spread_constraints: spread,
                     ..Default::default()
                 }),
             },
+            // Gives the cluster bus time to converge between pod restarts.
+            // Outside the controller-revision hash, so it triggers no roll of
+            // its own.
+            min_ready_seconds: Some(10),
             volume_claim_templates,
             persistent_volume_claim_retention_policy: rc
                 .spec
@@ -640,7 +616,7 @@ async fn ensure_cluster_topology(
     masters: i32,
     replicas_per_master: i32,
 ) -> Result<()> {
-    let total = masters + masters * replicas_per_master;
+    let total = total_pods(masters, replicas_per_master);
 
     let Some((seed_pod, _)) = find_seed(client, ns, sts_name, total).await? else {
         bootstrap(client, ns, sts_name, masters, replicas_per_master).await?;
@@ -1117,7 +1093,7 @@ async fn bootstrap(
 ) -> Result<()> {
     info!(%sts_name, "bootstrapping Redis cluster");
     let pod0 = format!("{sts_name}-0");
-    let total = masters + masters * replicas_per_master;
+    let total = total_pods(masters, replicas_per_master);
     let endpoints: Vec<String> = (0..total)
         .map(|i| format!("{}:{REDIS_PORT}", pod_hostname(sts_name, ns, i)))
         .collect();
@@ -1170,4 +1146,62 @@ async fn pod_exec(client: &Client, ns: &str, pod: &str, cmd: &[String]) -> Resul
         warn!(?cmd, %err, "exec produced stderr");
     }
     Ok(String::from_utf8_lossy(&out_buf).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crd::redis_cluster::RedisClusterSpec;
+
+    #[test]
+    fn cluster_statefulset_gets_default_topology_spread() {
+        let rc = RedisCluster::new(
+            "redis",
+            RedisClusterSpec {
+                masters: 3,
+                replicas_per_master: 1,
+                ..Default::default()
+            },
+        );
+        let sts = build_statefulset(&rc, "ns", OwnerReference::default());
+        let spec = sts.spec.unwrap();
+        assert_eq!(spec.replicas, Some(6));
+        let c = spec
+            .template
+            .spec
+            .unwrap()
+            .topology_spread_constraints
+            .expect("expected a default spread constraint");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].max_skew, 1);
+        assert_eq!(c[0].topology_key, "kubernetes.io/hostname");
+        assert_eq!(c[0].when_unsatisfiable, "ScheduleAnyway");
+        assert_eq!(
+            c[0].label_selector.clone().unwrap().match_labels.unwrap(),
+            labels("redis")
+        );
+    }
+
+    #[test]
+    fn cluster_statefulset_omits_spread_when_opted_out() {
+        let rc = RedisCluster::new(
+            "redis",
+            RedisClusterSpec {
+                masters: 3,
+                replicas_per_master: 1,
+                topology_spread_constraints: Some(vec![]),
+                ..Default::default()
+            },
+        );
+        let sts = build_statefulset(&rc, "ns", OwnerReference::default());
+        assert!(
+            sts.spec
+                .unwrap()
+                .template
+                .spec
+                .unwrap()
+                .topology_spread_constraints
+                .is_none()
+        );
+    }
 }
