@@ -1,0 +1,437 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: redises.redis.jgaskins.dev
+spec:
+  group: redis.jgaskins.dev
+  names:
+    categories: []
+    kind: Redis
+    plural: redises
+    shortNames:
+    - rds
+    singular: redis
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.masterPod
+      name: Primary
+      type: string
+    - jsonPath: .status.readyReplicas
+      name: Ready
+      type: integer
+    - jsonPath: .spec.replicas
+      name: Desired
+      type: integer
+    - description: Replicas connected to primary
+      jsonPath: .status.connectedReplicas
+      name: Connected
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for RedisSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              image:
+                default: redis:8
+                type: string
+              replicas:
+                default: 1
+                format: int32
+                type: integer
+              resources:
+                description: |-
+                  Container resource requests/limits for the Redis pods. Defaults: 1Gi
+                  memory (requests and limits), 1.2 CPU requests, 2 CPU limits. User
+                  values are merged per-key with the defaults — overriding `cpu` alone
+                  preserves the default memory settings, and vice versa.
+
+                  `maxmemory` is derived from the effective memory limit (70%) and
+                  passed to redis-server, so users don't need to keep it in sync
+                  manually.
+                nullable: true
+                properties:
+                  limits:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
+                  requests:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
+                type: object
+              sentinel:
+                description: |-
+                  When set, the operator deploys a Redis Sentinel StatefulSet alongside
+                  the Redis pods to provide automatic failover. Clients that aren't
+                  Sentinel-aware can still use the `<name>-primary` Service, whose
+                  selector the operator updates to track the current master.
+                nullable: true
+                properties:
+                  image:
+                    description: |-
+                      Override image for Sentinel pods. Defaults to the Redis spec image —
+                      `redis-sentinel` ships in the same container as `redis-server`.
+                    nullable: true
+                    type: string
+                  quorum:
+                    description: |-
+                      Quorum required to flag the master as objectively down and trigger
+                      failover. Defaults to majority of `replicas`. Lower values risk
+                      split-brain during network partitions.
+                    format: int32
+                    nullable: true
+                    type: integer
+                  replicas:
+                    default: 3
+                    description: |-
+                      Number of Sentinel pods. Should be ≥ 3 — Sentinel needs majority
+                      quorum to declare a master down, so 2 sentinels can't tolerate any
+                      failure.
+                    format: int32
+                    type: integer
+                  resources:
+                    description: |-
+                      Container resource requests/limits. When omitted, the operator
+                      applies a safe default (cpu 50m, mem 64Mi requests; mem 128Mi limit)
+                      so the pod isn't BestEffort QoS — BestEffort sentinels get throttled
+                      into TILT mode under node pressure. To opt out of the default and
+                      run BestEffort intentionally, set `resources: {}`.
+                    nullable: true
+                    properties:
+                      limits:
+                        additionalProperties:
+                          type: string
+                        nullable: true
+                        type: object
+                      requests:
+                        additionalProperties:
+                          type: string
+                        nullable: true
+                        type: object
+                    type: object
+                  storage:
+                    description: |-
+                      Persistent storage for `sentinel.conf`. When set, sentinels survive
+                      pod restarts with their persisted master view, avoiding the brief
+                      re-monitor-pod-0 window after an unrelated sentinel restart. When
+                      unset, sentinels use emptyDir and rediscover topology via INFO on
+                      each restart.
+                    nullable: true
+                    properties:
+                      retention:
+                        description: |-
+                          PVC retention policy. Mirrors StatefulSet's
+                          `persistentVolumeClaimRetentionPolicy`. Both fields default to `Retain`
+                          when unset (k8s default), preserving data on scale-down or deletion.
+                        nullable: true
+                        properties:
+                          whenDeleted:
+                            description: '"Retain" or "Delete". Applies when the StatefulSet is deleted.'
+                            nullable: true
+                            type: string
+                          whenScaled:
+                            description: '"Retain" or "Delete". Applies when the StatefulSet is scaled down.'
+                            nullable: true
+                            type: string
+                        type: object
+                      size:
+                        default: 1Gi
+                        type: string
+                      storageClass:
+                        nullable: true
+                        type: string
+                    type: object
+                type: object
+              storage:
+                nullable: true
+                properties:
+                  retention:
+                    description: |-
+                      PVC retention policy. Mirrors StatefulSet's
+                      `persistentVolumeClaimRetentionPolicy`. Both fields default to `Retain`
+                      when unset (k8s default), preserving data on scale-down or deletion.
+                    nullable: true
+                    properties:
+                      whenDeleted:
+                        description: '"Retain" or "Delete". Applies when the StatefulSet is deleted.'
+                        nullable: true
+                        type: string
+                      whenScaled:
+                        description: '"Retain" or "Delete". Applies when the StatefulSet is scaled down.'
+                        nullable: true
+                        type: string
+                    type: object
+                  size:
+                    default: 1Gi
+                    type: string
+                  storageClass:
+                    nullable: true
+                    type: string
+                type: object
+            type: object
+          status:
+            nullable: true
+            properties:
+              connectedReplicas:
+                default: 0
+                description: |-
+                  `connected_slaves` reported by `INFO replication` on the primary.
+                  Zero when `replicas == 1` (no replicas configured) or before the
+                  primary becomes ready.
+                format: int32
+                type: integer
+              masterPod:
+                description: |-
+                  Pod name (short form) of the current master. Easier to read than the
+                  full FQDN and matches what `kubectl get pods` shows.
+                nullable: true
+                type: string
+              phase:
+                nullable: true
+                type: string
+              primaryHost:
+                description: |-
+                  FQDN of the current master. Tracks Sentinel-driven failovers when
+                  Sentinel is enabled; otherwise always pod-0.
+                nullable: true
+                type: string
+              readyReplicas:
+                default: 0
+                format: int32
+                type: integer
+              sentinelReplicasReady:
+                default: 0
+                description: |-
+                  Number of Sentinel pods that report ready. Zero when Sentinel is
+                  disabled.
+                format: int32
+                type: integer
+            type: object
+        required:
+        - spec
+        title: Redis
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: redisclusters.redis.jgaskins.dev
+spec:
+  group: redis.jgaskins.dev
+  names:
+    categories: []
+    kind: RedisCluster
+    plural: redisclusters
+    shortNames:
+    - rdsc
+    singular: rediscluster
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.masters
+      name: Masters
+      type: integer
+    - jsonPath: .status.replicas
+      name: Replicas
+      type: integer
+    - description: Slots assigned (16384 when fully populated)
+      jsonPath: .status.slotsAssigned
+      name: Slots
+      type: integer
+    - description: Replica imbalance (0 when fully balanced)
+      jsonPath: .status.replicaImbalance
+      name: Imbalance
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for RedisClusterSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              image:
+                default: redis:8
+                type: string
+              masters:
+                default: 3
+                format: int32
+                type: integer
+              podDisruptionBudget:
+                description: |-
+                  Mirrors `policy/v1` `PodDisruptionBudgetSpec` — the operator builds and
+                  owns the PDB, selecting on the cluster's pods. Exactly one of
+                  `minAvailable` / `maxUnavailable` should be set; if neither is, the PDB
+                  is left absent.
+                nullable: true
+                properties:
+                  maxUnavailable:
+                    description: Integer or percentage. Mutually exclusive with `minAvailable`.
+                    nullable: true
+                    x-kubernetes-int-or-string: true
+                  minAvailable:
+                    description: Integer or percentage (e.g. `1` or `"50%"`).
+                    nullable: true
+                    x-kubernetes-int-or-string: true
+                  unhealthyPodEvictionPolicy:
+                    description: '`IfHealthyBudget` (default) or `AlwaysAllow`.'
+                    nullable: true
+                    type: string
+                type: object
+              replicasPerMaster:
+                default: 1
+                format: int32
+                type: integer
+              resources:
+                description: |-
+                  Container resource requests/limits for each cluster pod. Defaults:
+                  1Gi memory (requests and limits), 1.2 CPU requests, 2 CPU limits.
+                  User values are merged per-key with the defaults — overriding `cpu`
+                  alone preserves the default memory settings, and vice versa.
+
+                  `maxmemory` is derived from the effective memory limit (70%) and
+                  passed to redis-server, so users don't need to keep it in sync
+                  manually.
+                nullable: true
+                properties:
+                  limits:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
+                  requests:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
+                type: object
+              storage:
+                nullable: true
+                properties:
+                  retention:
+                    description: |-
+                      PVC retention policy. Mirrors StatefulSet's
+                      `persistentVolumeClaimRetentionPolicy`. Both fields default to `Retain`
+                      when unset (k8s default), preserving data on scale-down or deletion.
+                    nullable: true
+                    properties:
+                      whenDeleted:
+                        description: '"Retain" or "Delete". Applies when the StatefulSet is deleted.'
+                        nullable: true
+                        type: string
+                      whenScaled:
+                        description: '"Retain" or "Delete". Applies when the StatefulSet is scaled down.'
+                        nullable: true
+                        type: string
+                    type: object
+                  size:
+                    default: 1Gi
+                    type: string
+                  storageClass:
+                    nullable: true
+                    type: string
+                type: object
+            type: object
+          status:
+            nullable: true
+            properties:
+              clusterState:
+                description: Raw `cluster_state` from Redis (`ok`, `fail`, etc.).
+                nullable: true
+                type: string
+              masters:
+                default: 0
+                description: Number of masters currently in the cluster.
+                format: int32
+                type: integer
+              nodes:
+                description: Per-node breakdown, sorted by hostname for stable diffs.
+                items:
+                  properties:
+                    hostname:
+                      description: Announced hostname (typically `<sts>-<ord>.<sts>.<ns>.svc.cluster.local`).
+                      type: string
+                    id:
+                      description: Redis Cluster node ID (40-char hex).
+                      type: string
+                    masterId:
+                      description: For replicas, the ID of the master they replicate. Empty for masters.
+                      type: string
+                    replicaCount:
+                      default: 0
+                      description: For masters, number of replicas attached. Always 0 for replicas.
+                      format: int32
+                      type: integer
+                    role:
+                      description: '`master` or `replica`.'
+                      type: string
+                    slotCount:
+                      default: 0
+                      description: For masters, number of slots owned. Always 0 for replicas.
+                      format: int32
+                      type: integer
+                  required:
+                  - hostname
+                  - id
+                  - role
+                  type: object
+                type: array
+              phase:
+                description: |-
+                  High-level rollup. `Running` only when cluster_state=ok, all 16384 slots
+                  are assigned, and replicas are perfectly distributed; otherwise `Degraded`
+                  or `Pending`.
+                nullable: true
+                type: string
+              readyNodes:
+                default: 0
+                description: '`cluster_known_nodes` from Redis — total nodes the cluster reports.'
+                format: int32
+                type: integer
+              replicaImbalance:
+                default: 0
+                description: |-
+                  Sum of `|observed_replicas - replicasPerMaster|` across all masters.
+                  Zero when every master has exactly the desired number of replicas.
+                format: int32
+                type: integer
+              replicas:
+                default: 0
+                description: Number of replicas currently in the cluster.
+                format: int32
+                type: integer
+              slotsAssigned:
+                default: 0
+                description: Sum of slots owned across all masters. 16384 when fully assigned.
+                format: int32
+                type: integer
+            type: object
+        required:
+        - spec
+        title: RedisCluster
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
