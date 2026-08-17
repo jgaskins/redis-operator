@@ -7,9 +7,9 @@ use k8s_openapi::api::apps::v1::{
     StatefulSet, StatefulSetPersistentVolumeClaimRetentionPolicy, StatefulSetSpec,
 };
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, ExecAction, PersistentVolumeClaim, PersistentVolumeClaimSpec,
-    Pod, PodSpec, PodTemplateSpec, Probe, Service, ServicePort, ServiceSpec, VolumeMount,
-    VolumeResourceRequirements,
+    Container, ContainerPort, EmptyDirVolumeSource, EnvVar, ExecAction, PersistentVolumeClaim,
+    PersistentVolumeClaimSpec, Pod, PodSpec, PodTemplateSpec, Probe, Service, ServicePort,
+    ServiceSpec, Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -25,7 +25,7 @@ use tracing::{info, warn};
 
 use crate::controller::{
     Context, FIELD_MANAGER, PdbRequest, PdbVerdict, apply, effective_redis_resources,
-    effective_topology_spread, maxmemory_bytes, reconcile_pdb,
+    effective_topology_spread, maxmemory_bytes, persistence_args, reconcile_pdb,
 };
 use crate::crd::RedisCluster;
 use crate::crd::redis_cluster::{NodeStatus, RedisClusterStatus, total_pods};
@@ -149,7 +149,8 @@ async fn reconcile(rc: Arc<RedisCluster>, ctx: Arc<Context>) -> Result<Action> {
     )
     .await?;
 
-    let status = compute_status(&ctx.client, &ns, &name, total, rc.spec.replicas_per_master).await?;
+    let status =
+        compute_status(&ctx.client, &ns, &name, total, rc.spec.replicas_per_master).await?;
     set_status(&rc_api, &name, &status).await?;
 
     Ok(Action::requeue(Duration::from_secs(60)))
@@ -225,7 +226,11 @@ async fn compute_status(
             NodeStatus {
                 id: n.id.clone(),
                 hostname: n.hostname.clone(),
-                role: if is_master { "master".into() } else { "replica".into() },
+                role: if is_master {
+                    "master".into()
+                } else {
+                    "replica".into()
+                },
                 master_id: n.master_id.clone().unwrap_or_default(),
                 slot_count: if is_master { n.slot_count() as i32 } else { 0 },
                 replica_count: if is_master {
@@ -238,16 +243,14 @@ async fn compute_status(
         .collect();
     node_statuses.sort_by(|a, b| a.hostname.cmp(&b.hostname));
 
-    let phase = if info.cluster_state == "ok"
-        && slots_assigned == TOTAL_SLOTS
-        && replica_imbalance == 0
-    {
-        "Running"
-    } else if info.cluster_state == "ok" {
-        "Degraded"
-    } else {
-        "Pending"
-    };
+    let phase =
+        if info.cluster_state == "ok" && slots_assigned == TOTAL_SLOTS && replica_imbalance == 0 {
+            "Running"
+        } else if info.cluster_state == "ok" {
+            "Degraded"
+        } else {
+            "Pending"
+        };
 
     Ok(RedisClusterStatus {
         ready_nodes: info.cluster_known_nodes,
@@ -316,13 +319,20 @@ fn build_statefulset(rc: &RedisCluster, ns: &str, owner: OwnerReference) -> Stat
     let l = labels(&name);
     let replicas = rc.spec.total_pods();
 
-    let (volume_mounts, volume_claim_templates) = match &rc.spec.storage {
+    // `/data` is mounted either way. Beyond the RDB/AOF files it holds
+    // `nodes.conf`, the cluster identity and slot map — previously that landed
+    // on the container's writable layer when `storage` was unset, so a mere
+    // container restart lost the node's identity and forced the heal path in
+    // `reconcile_stale_members` to forget and re-add it. An emptyDir survives
+    // that, though still not a reschedule.
+    let volume_mounts = Some(vec![VolumeMount {
+        name: DATA_VOLUME.into(),
+        mount_path: "/data".into(),
+        ..Default::default()
+    }]);
+
+    let (volume_claim_templates, pod_volumes) = match &rc.spec.storage {
         Some(s) => {
-            let mounts = vec![VolumeMount {
-                name: DATA_VOLUME.into(),
-                mount_path: "/data".into(),
-                ..Default::default()
-            }];
             let mut requests = BTreeMap::new();
             requests.insert("storage".into(), Quantity(s.size.clone()));
             let pvcs = vec![PersistentVolumeClaim {
@@ -341,9 +351,16 @@ fn build_statefulset(rc: &RedisCluster, ns: &str, owner: OwnerReference) -> Stat
                 }),
                 ..Default::default()
             }];
-            (Some(mounts), Some(pvcs))
+            (Some(pvcs), None)
         }
-        None => (None, None),
+        None => (
+            None,
+            Some(vec![Volume {
+                name: DATA_VOLUME.into(),
+                empty_dir: Some(EmptyDirVolumeSource::default()),
+                ..Default::default()
+            }]),
+        ),
     };
 
     let probe = Some(Probe {
@@ -399,11 +416,11 @@ fn build_statefulset(rc: &RedisCluster, ns: &str, owner: OwnerReference) -> Stat
                                 --cluster-node-timeout 5000 \
                                 --cluster-announce-hostname \
                                   \"$(hostname).{svc}.{ns}.svc.cluster.local\" \
-                                --cluster-preferred-endpoint-type hostname \
-                                --appendonly yes \
-                                --dir /data{maxmem}",
+                                --cluster-preferred-endpoint-type hostname\
+                                {persistence}{maxmem}",
                             svc = name,
                             ns = ns,
+                            persistence = persistence_args(rc.spec.persistence.as_ref()),
                         )]),
                         ports: Some(vec![
                             ContainerPort {
@@ -426,6 +443,7 @@ fn build_statefulset(rc: &RedisCluster, ns: &str, owner: OwnerReference) -> Stat
                         ..Default::default()
                     }],
                     topology_spread_constraints: spread,
+                    volumes: pod_volumes,
                     ..Default::default()
                 }),
             },
@@ -599,13 +617,7 @@ async fn pod_ip(client: &Client, ns: &str, pod: &str) -> Result<Option<String>> 
 }
 
 async fn cluster_info(client: &Client, ns: &str, pod: &str) -> Result<ClusterInfo> {
-    let out = exec(
-        client,
-        ns,
-        pod,
-        &["redis-cli", "cluster", "info"],
-    )
-    .await?;
+    let out = exec(client, ns, pod, &["redis-cli", "cluster", "info"]).await?;
     Ok(parse_cluster_info(&out))
 }
 
@@ -662,13 +674,7 @@ async fn ensure_cluster_topology(
                     client,
                     ns,
                     &seed_pod,
-                    &[
-                        "redis-cli",
-                        "--cluster",
-                        "add-node",
-                        &pod_addr,
-                        &seed,
-                    ],
+                    &["redis-cli", "--cluster", "add-node", &pod_addr, &seed],
                 )
                 .await?;
                 current_master_count += 1;
@@ -774,7 +780,13 @@ async fn repair_replication(client: &Client, ns: &str, nodes: &[ClusterNode]) ->
             master_id = %master.id,
             "replica is syncing from a stale master address; re-pointing"
         );
-        exec(client, ns, pod, &["redis-cli", "cluster", "replicate", &master.id]).await?;
+        exec(
+            client,
+            ns,
+            pod,
+            &["redis-cli", "cluster", "replicate", &master.id],
+        )
+        .await?;
     }
     Ok(())
 }
@@ -862,7 +874,13 @@ async fn heal_failed_nodes(
                  re-introducing via CLUSTER MEET"
             );
             let port = REDIS_PORT.to_string();
-            exec(client, ns, pod, &["redis-cli", "cluster", "meet", &ip, &port]).await?;
+            exec(
+                client,
+                ns,
+                pod,
+                &["redis-cli", "cluster", "meet", &ip, &port],
+            )
+            .await?;
             healed = true;
             continue;
         }
@@ -911,15 +929,12 @@ async fn balance_replicas(
     seed_pod: &str,
     replicas_per_master: i32,
 ) -> Result<()> {
-    let nodes = parse_cluster_nodes(
-        &exec(client, ns, seed_pod, &["redis-cli", "cluster", "nodes"]).await?,
-    );
+    let nodes =
+        parse_cluster_nodes(&exec(client, ns, seed_pod, &["redis-cli", "cluster", "nodes"]).await?);
 
     let masters: Vec<&ClusterNode> = nodes.iter().filter(|n| n.is_master()).collect();
-    let mut replicas_by_master: BTreeMap<String, Vec<&ClusterNode>> = masters
-        .iter()
-        .map(|m| (m.id.clone(), Vec::new()))
-        .collect();
+    let mut replicas_by_master: BTreeMap<String, Vec<&ClusterNode>> =
+        masters.iter().map(|m| (m.id.clone(), Vec::new())).collect();
     for n in &nodes {
         if let Some(mid) = &n.master_id {
             replicas_by_master.entry(mid.clone()).or_default().push(n);
@@ -953,7 +968,11 @@ async fn balance_replicas(
             };
             let to_master = deficits[idx].0.clone();
             deficits[idx].1 -= 1;
-            moves.push((pod_of(&replica.hostname).to_string(), m.id.clone(), to_master));
+            moves.push((
+                pod_of(&replica.hostname).to_string(),
+                m.id.clone(),
+                to_master,
+            ));
         }
     }
 
@@ -1000,9 +1019,7 @@ async fn drain_for_scale_down(
     let surviving_master = nodes
         .iter()
         .find(|n| n.is_master() && !removed.contains(&n.hostname))
-        .ok_or_else(|| {
-            Error::Exec("scale-down would leave zero surviving masters".into())
-        })?
+        .ok_or_else(|| Error::Exec("scale-down would leave zero surviving masters".into()))?
         .clone();
 
     // Pass 1: remove replicas (no slot migration needed).

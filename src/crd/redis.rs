@@ -5,6 +5,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
 #[kube(
@@ -46,6 +47,11 @@ pub struct RedisSpec {
     /// manually.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourcesSpec>,
+
+    /// How the dataset is written to disk. Defaults to both RDB and AOF on,
+    /// with AOF fsyncing once a second. See `PersistenceSpec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistence: Option<PersistenceSpec>,
 
     /// When set, the operator deploys a Redis Sentinel StatefulSet alongside
     /// the Redis pods to provide automatic failover. Clients that aren't
@@ -248,6 +254,144 @@ pub struct StorageSpec {
 
 fn default_storage_size() -> String {
     "1Gi".to_string()
+}
+
+/// How the dataset is written to disk so it survives a restart.
+///
+/// Omitting this block means the same as `{}`: both RDB and AOF enabled, AOF
+/// fsyncing every second. The pair is the default because they recover
+/// different things. AOF bounds data loss to roughly one second of writes,
+/// while RDB gives a compact snapshot that loads faster and — the part that
+/// matters on a rolling update — carries the replication ID and offset in its
+/// aux fields, letting a restarted replica ask its master for a *partial*
+/// resync instead of forcing a fork-and-ship of the entire dataset.
+///
+/// Applies uniformly to every pod in the workload, and deliberately so. Roles
+/// are not fixed here: under Sentinel or Redis Cluster any pod may be promoted
+/// to master, and a StatefulSet has a single pod template, so there is no
+/// coherent way to configure replicas separately. It is also the safer
+/// arrangement — a persistence-less node that gets promoted and then restarts
+/// comes back empty and replicates that empty dataset onto its own replicas.
+///
+/// Files are written to `/data`, which is the PVC when `storage` is set and an
+/// emptyDir otherwise. Without `storage`, persistence therefore survives a
+/// container restart (an OOM kill, a failed liveness probe) but not a
+/// reschedule onto another node.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistenceSpec {
+    /// Master switch. When false, both RDB and AOF are disabled regardless of
+    /// the `rdb` and `aof` blocks below and Redis runs as a pure in-memory
+    /// cache, losing its dataset on every restart.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdb: Option<RdbSpec>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aof: Option<AofSpec>,
+}
+
+impl Default for PersistenceSpec {
+    /// Matches what serde produces for `persistence: {}`, so
+    /// `PersistenceSpec::default()` can stand in for an absent block.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rdb: None,
+            aof: None,
+        }
+    }
+}
+
+/// Point-in-time snapshotting (`save` / `BGSAVE`).
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RdbSpec {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Snapshot triggers, each `"<seconds> <changes>"` — snapshot when at
+    /// least `changes` keys changed within `seconds`. Defaults to Redis's own
+    /// `3600 1`, `300 100`, `60 10000`.
+    ///
+    /// An empty list schedules no automatic snapshots, which is the same thing
+    /// `enabled: false` does: both emit `--save ""`. Neither stops Redis from
+    /// producing an RDB for a replication full sync or an explicit `BGSAVE` —
+    /// there is no Redis setting that does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("items" = json!({"type": "string", "pattern": r"^\d+ \d+$"})))]
+    pub save: Option<Vec<String>>,
+}
+
+impl Default for RdbSpec {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            save: None,
+        }
+    }
+}
+
+/// Append-only file logging.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AofSpec {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// How often the append-only file is fsynced. Defaults to `everysec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fsync: Option<FsyncPolicy>,
+}
+
+impl Default for AofSpec {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            fsync: None,
+        }
+    }
+}
+
+/// Redis's `appendfsync` policy. Modelled as an enum so the API server rejects
+/// a bad value at `kubectl apply` time — redis-server refuses to start on an
+/// unrecognised one, which would otherwise surface as a CrashLoopBackOff.
+///
+/// The third variant is spelled `never` rather than Redis's own `no`. `no` is
+/// unusable as a schema enum value here: serde_yaml emits it bare (YAML 1.2,
+/// where it is a string), but the API server parses CRDs with go-yaml's YAML
+/// 1.1, where bare `no` is the boolean `false` — which would land a boolean
+/// inside a `type: string` enum and make the value unmatchable. Spelling it
+/// `never` sidesteps that, and spares users the same quoting trap in their own
+/// manifests. It maps to `appendfsync no` on the redis-server command line.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum FsyncPolicy {
+    /// fsync on every write. Safest and slowest.
+    Always,
+    /// fsync once a second, bounding loss to about a second of writes.
+    #[default]
+    Everysec,
+    /// Never fsync explicitly; leave it to the kernel, which typically flushes
+    /// every 30 seconds. Fastest, and the weakest durability guarantee.
+    Never,
+}
+
+impl FsyncPolicy {
+    /// The literal `appendfsync` value redis-server expects.
+    pub fn as_redis_value(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Everysec => "everysec",
+            Self::Never => "no",
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// PVC retention policy. Mirrors StatefulSet's

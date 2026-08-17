@@ -8,8 +8,8 @@ use k8s_openapi::api::apps::v1::{
 };
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EmptyDirVolumeSource, EnvVar, ExecAction, PersistentVolumeClaim,
-    PersistentVolumeClaimSpec, Pod, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
-    Service, ServicePort, ServiceSpec, Volume, VolumeMount, VolumeResourceRequirements,
+    PersistentVolumeClaimSpec, Pod, PodSpec, PodTemplateSpec, Probe, ResourceRequirements, Service,
+    ServicePort, ServiceSpec, Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -26,7 +26,7 @@ use tracing::{info, warn};
 
 use crate::controller::{
     Context, FIELD_MANAGER, PdbRequest, PdbVerdict, apply, effective_redis_resources,
-    effective_topology_spread, emit, maxmemory_bytes, reconcile_pdb,
+    effective_topology_spread, emit, maxmemory_bytes, persistence_args, reconcile_pdb,
 };
 use crate::crd::Redis;
 use crate::crd::redis::{PodDisruptionBudgetSpec, RedisSpec, ResourcesSpec, SentinelSpec};
@@ -92,8 +92,18 @@ async fn reconcile(redis: Arc<Redis>, ctx: Arc<Context>) -> Result<Action> {
     let redis_api: Api<Redis> = Api::namespaced(ctx.client.clone(), &ns);
     let obj_ref = redis.object_ref(&());
 
-    apply(&svc_api, &name, &build_headless_service(&redis, &ns, owner.clone())).await?;
-    apply(&sts_api, &name, &build_redis_statefulset(&redis, &ns, owner.clone())).await?;
+    apply(
+        &svc_api,
+        &name,
+        &build_headless_service(&redis, &ns, owner.clone()),
+    )
+    .await?;
+    apply(
+        &sts_api,
+        &name,
+        &build_redis_statefulset(&redis, &ns, owner.clone()),
+    )
+    .await?;
     apply(
         &svc_api,
         &replicas_service_name(&name),
@@ -183,13 +193,24 @@ async fn reconcile(redis: Arc<Redis>, ctx: Arc<Context>) -> Result<Action> {
         )
         .await?;
     } else {
-        delete_if_exists(svc_api.delete(&sentinel_name, &DeleteParams::default()).await)?;
-        delete_if_exists(sts_api.delete(&sentinel_name, &DeleteParams::default()).await)?;
-        delete_if_exists(pdb_api.delete(&sentinel_name, &DeleteParams::default()).await)?;
+        delete_if_exists(
+            svc_api
+                .delete(&sentinel_name, &DeleteParams::default())
+                .await,
+        )?;
+        delete_if_exists(
+            sts_api
+                .delete(&sentinel_name, &DeleteParams::default())
+                .await,
+        )?;
+        delete_if_exists(
+            pdb_api
+                .delete(&sentinel_name, &DeleteParams::default())
+                .await,
+        )?;
     }
 
-    let master_pod =
-        determine_master_pod(&ctx.client, &svc_api, &redis, &ns).await?;
+    let master_pod = determine_master_pod(&ctx.client, &svc_api, &redis, &ns).await?;
 
     apply(
         &svc_api,
@@ -535,11 +556,10 @@ fn build_redis_args(redis: &Redis, ns: &str) -> Vec<String> {
     let maxmem = maxmemory_bytes(&resources)
         .map(|b| format!(" --maxmemory {b}"))
         .unwrap_or_default();
-    let extra = if redis.spec.storage.is_some() {
-        format!(" --appendonly yes --dir /data{maxmem}")
-    } else {
-        maxmem
-    };
+    let extra = format!(
+        "{}{maxmem}",
+        persistence_args(redis.spec.persistence.as_ref())
+    );
 
     let script = if redis.spec.sentinel.is_some() {
         let sentinel_svc = sentinel_sts_name(&name);
@@ -563,10 +583,20 @@ if [ ! -f "$CONF" ]; then
   printf '%s\n' "$REPLICAOF" > "$CONF"
 fi
 # CONFIG REWRITE (invoked by Sentinel on failover) serializes the full
-# effective config, including a `loadmodule` line for every loaded module.
-# The redis:8 entrypoint already passes `--loadmodule` for bundled modules,
-# so a persisted duplicate aborts the server on next start. Strip them.
-sed -i '/^[[:space:]]*loadmodule[[:space:]]/d' "$CONF"
+# effective config back into this file. Two directives have to be stripped
+# before the next start, leaving the conf carrying only the `replicaof` line
+# it exists for:
+#
+#   loadmodule  - one line per loaded module. The redis:8 entrypoint already
+#                 passes --loadmodule for bundled modules, so a persisted
+#                 duplicate aborts the server on next start.
+#   persistence - a command-line `--save` does not replace `save` lines from
+#                 the config file, it appends to them. Left in place, the CR
+#                 could never lower a save point again and the list would grow
+#                 on every failover-and-restart cycle. The others override
+#                 correctly, but are stripped too so the CR stays the single
+#                 source of truth rather than relying on that asymmetry.
+sed -i -E '/^[[:space:]]*(loadmodule|save|appendonly|appendfsync|dir|dbfilename|appendfilename|appenddirname)[[:space:]]/d' "$CONF"
 exec docker-entrypoint.sh redis-server "$CONF"{extra} --replica-announce-ip "$HOST" --replica-announce-port {REDIS_PORT}
 "#
         )
@@ -590,13 +620,18 @@ fn build_redis_statefulset(redis: &Redis, ns: &str, owner: OwnerReference) -> St
     let name = redis.name_any();
     let l = labels(&name);
 
-    let (volume_mounts, volume_claim_templates) = match &redis.spec.storage {
+    // `/data` is mounted either way: it holds the RDB/AOF files, and under
+    // Sentinel also the `redis.conf` carrying the `replicaof` directive that
+    // survives a failover. Without `storage` it is an emptyDir, which still
+    // outlives a container restart — just not a reschedule.
+    let volume_mounts = Some(vec![VolumeMount {
+        name: DATA_VOLUME.to_string(),
+        mount_path: "/data".to_string(),
+        ..Default::default()
+    }]);
+
+    let (volume_claim_templates, pod_volumes) = match &redis.spec.storage {
         Some(s) => {
-            let mounts = vec![VolumeMount {
-                name: DATA_VOLUME.to_string(),
-                mount_path: "/data".to_string(),
-                ..Default::default()
-            }];
             let mut requests = BTreeMap::new();
             requests.insert("storage".to_string(), Quantity(s.size.clone()));
             let pvcs = vec![PersistentVolumeClaim {
@@ -615,9 +650,16 @@ fn build_redis_statefulset(redis: &Redis, ns: &str, owner: OwnerReference) -> St
                 }),
                 ..Default::default()
             }];
-            (Some(mounts), Some(pvcs))
+            (Some(pvcs), None)
         }
-        None => (None, None),
+        None => (
+            None,
+            Some(vec![Volume {
+                name: DATA_VOLUME.to_string(),
+                empty_dir: Some(EmptyDirVolumeSource::default()),
+                ..Default::default()
+            }]),
+        ),
     };
 
     let probe = Some(Probe {
@@ -668,13 +710,12 @@ fn build_redis_statefulset(redis: &Redis, ns: &str, owner: OwnerReference) -> St
                         }]),
                         liveness_probe: probe.clone(),
                         readiness_probe: probe,
-                        resources: Some(effective_redis_resources(
-                            redis.spec.resources.as_ref(),
-                        )),
+                        resources: Some(effective_redis_resources(redis.spec.resources.as_ref())),
                         volume_mounts,
                         ..Default::default()
                     }],
                     topology_spread_constraints: spread,
+                    volumes: pod_volumes,
                     ..Default::default()
                 }),
             },
@@ -969,7 +1010,10 @@ async fn determine_master_pod(
             Ok(pod0)
         }
         Err(e) => {
-            warn!(?e, "sentinel query failed; preserving prior primary-Service selector");
+            warn!(
+                ?e,
+                "sentinel query failed; preserving prior primary-Service selector"
+            );
             preserve_existing_master(svc_api, &name, &pod0).await
         }
     }
@@ -979,19 +1023,17 @@ async fn determine_master_pod(
 /// replicas Service selector. Filters by `app.kubernetes.io/name=redis` so
 /// sentinel pods are excluded. Skips patches when the label is already
 /// correct to avoid update churn.
-async fn label_pods_by_role(
-    client: &Client,
-    ns: &str,
-    name: &str,
-    master_pod: &str,
-) -> Result<()> {
+async fn label_pods_by_role(client: &Client, ns: &str, name: &str, master_pod: &str) -> Result<()> {
     let api: Api<Pod> = Api::namespaced(client.clone(), ns);
-    let selector =
-        format!("app.kubernetes.io/name=redis,app.kubernetes.io/instance={name}");
+    let selector = format!("app.kubernetes.io/name=redis,app.kubernetes.io/instance={name}");
     let pods = api.list(&ListParams::default().labels(&selector)).await?;
     for pod in pods.items {
         let pod_name = pod.name_any();
-        let role = if pod_name == master_pod { "master" } else { "replica" };
+        let role = if pod_name == master_pod {
+            "master"
+        } else {
+            "replica"
+        };
         if pod.labels().get(ROLE_LABEL).map(String::as_str) == Some(role) {
             continue;
         }
@@ -1016,11 +1058,7 @@ async fn preserve_existing_master(
     Ok(existing.unwrap_or_else(|| fallback.to_string()))
 }
 
-async fn query_sentinel_master(
-    client: &Client,
-    ns: &str,
-    pod: &str,
-) -> Result<Option<String>> {
+async fn query_sentinel_master(client: &Client, ns: &str, pod: &str) -> Result<Option<String>> {
     let out = pod_exec(
         client,
         ns,
@@ -1126,6 +1164,44 @@ async fn pod_exec(client: &Client, ns: &str, pod: &str, cmd: &[&str]) -> Result<
 mod tests {
     use super::*;
     use crate::crd::redis::RedisSpec;
+
+    fn args_for(spec: RedisSpec) -> String {
+        let mut r = Redis::new("cache", spec);
+        r.meta_mut().namespace = Some("default".into());
+        build_redis_args(&r, "default")[2].clone()
+    }
+
+    #[test]
+    fn redis_args_carry_persistence_without_storage() {
+        // Persistence no longer depends on `storage` — it lands on the
+        // emptyDir at /data instead, surviving a container restart.
+        let script = args_for(RedisSpec {
+            storage: None,
+            ..Default::default()
+        });
+        assert!(script.contains("--dir /data"));
+        assert!(script.contains(r#"--save "3600 1 300 100 60 10000""#));
+        assert!(script.contains("--appendonly yes --appendfsync everysec"));
+    }
+
+    #[test]
+    fn sentinel_conf_strip_covers_persistence_directives() {
+        // A command-line `--save` appends to config-file `save` lines rather
+        // than replacing them, so they must not survive a CONFIG REWRITE.
+        let script = args_for(RedisSpec {
+            sentinel: Some(SentinelSpec::default()),
+            ..Default::default()
+        });
+        let sed = script
+            .lines()
+            .find(|l| l.starts_with("sed -i"))
+            .expect("conf-stripping sed");
+        for directive in ["loadmodule", "save", "appendonly", "appendfsync", "dir"] {
+            assert!(sed.contains(directive), "sed should strip {directive}");
+        }
+        // The one directive the conf exists to carry must not be stripped.
+        assert!(!sed.contains("replicaof"));
+    }
 
     #[test]
     fn parse_connected_slaves_extracts_count() {

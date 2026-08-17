@@ -3,7 +3,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::redis::{PodDisruptionBudgetSpec, ResourcesSpec, StorageSpec};
+use super::redis::{PersistenceSpec, PodDisruptionBudgetSpec, ResourcesSpec, StorageSpec};
 
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
 #[kube(
@@ -37,6 +37,15 @@ pub struct RedisClusterSpec {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageSpec>,
+
+    /// How the dataset is written to disk. Defaults to both RDB and AOF on,
+    /// with AOF fsyncing once a second. See `PersistenceSpec`.
+    ///
+    /// `/data` is mounted regardless of this setting, because the cluster's
+    /// `nodes.conf` — the file holding each pod's cluster identity and slot
+    /// map — lives there whether or not the dataset is persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistence: Option<PersistenceSpec>,
 
     /// Container resource requests/limits for each cluster pod. Defaults:
     /// 1Gi memory (requests and limits), 1.2 CPU requests, 2 CPU limits.

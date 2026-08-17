@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::{
-    ObjectReference, ResourceRequirements, TopologySpreadConstraint,
-};
+use k8s_openapi::api::core::v1::{ObjectReference, ResourceRequirements, TopologySpreadConstraint};
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec as K8sPdbSpec};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
@@ -15,7 +13,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::crd::redis::{PodDisruptionBudgetSpec, ResourcesSpec};
+use crate::crd::redis::{PersistenceSpec, PodDisruptionBudgetSpec, ResourcesSpec};
 use crate::error::Result;
 
 pub mod redis;
@@ -101,6 +99,59 @@ pub fn effective_redis_resources(user: Option<&ResourcesSpec>) -> ResourceRequir
         }
     }
     rr
+}
+
+/// Redis's own default snapshot triggers, and what the `redis:8` image runs
+/// with when nothing overrides it.
+const DEFAULT_SAVE_POINTS: &str = "3600 1 300 100 60 10000";
+
+/// The `redis-server` flags implementing a `PersistenceSpec`, ready to be
+/// appended to the command line. Includes the leading space; returns flags for
+/// the default (RDB + AOF, fsync everysec) when `user` is `None`.
+///
+/// `--save` and `--appendonly` are always emitted explicitly, even when they
+/// match Redis's built-in defaults, so the CR stays the single source of truth
+/// — otherwise a base image that changed its defaults, or a `redis.conf` that
+/// Sentinel rewrote after a failover, would silently decide durability. For
+/// the same reason these are command-line flags rather than conf entries:
+/// arguments are applied after the config file, so they win over anything
+/// `CONFIG REWRITE` persisted.
+///
+/// `--dir /data` is unconditional. `/data` is always mounted — the PVC when
+/// `storage` is set, an emptyDir otherwise — and both kinds keep other state
+/// there too (`nodes.conf` for a cluster, the Sentinel-managed `redis.conf`
+/// for a Sentinel-enabled Redis).
+pub fn persistence_args(user: Option<&PersistenceSpec>) -> String {
+    let default = PersistenceSpec::default();
+    let p = user.unwrap_or(&default);
+
+    let rdb_on = p.enabled && p.rdb.as_ref().is_none_or(|r| r.enabled);
+    let aof_on = p.enabled && p.aof.as_ref().is_none_or(|a| a.enabled);
+
+    // Interpolated into a double-quoted shell word, which is safe because the
+    // CRD schema constrains every entry to `^\d+ \d+$`.
+    let save = if rdb_on {
+        p.rdb
+            .as_ref()
+            .and_then(|r| r.save.as_deref())
+            .map_or(DEFAULT_SAVE_POINTS.to_string(), |pts| pts.join(" "))
+    } else {
+        String::new()
+    };
+
+    let mut args = format!(" --dir /data --save \"{save}\"");
+    if aof_on {
+        let fsync = p
+            .aof
+            .as_ref()
+            .and_then(|a| a.fsync)
+            .unwrap_or_default()
+            .as_redis_value();
+        args.push_str(&format!(" --appendonly yes --appendfsync {fsync}"));
+    } else {
+        args.push_str(" --appendonly no");
+    }
+    args
 }
 
 /// Compute the `--maxmemory` value to pass to redis-server: 70% of the
@@ -465,6 +516,112 @@ pub fn effective_topology_spread(
 mod tests {
     use super::*;
 
+    use crate::crd::redis::{AofSpec, FsyncPolicy, RdbSpec};
+
+    #[test]
+    fn persistence_defaults_to_rdb_and_aof_everysec() {
+        // An absent block and an empty one must agree.
+        let expected = " --dir /data --save \"3600 1 300 100 60 10000\" \
+                        --appendonly yes --appendfsync everysec";
+        assert_eq!(persistence_args(None), expected);
+        assert_eq!(
+            persistence_args(Some(&PersistenceSpec::default())),
+            expected
+        );
+    }
+
+    #[test]
+    fn persistence_master_switch_disables_both() {
+        let p = PersistenceSpec {
+            enabled: false,
+            // Explicitly on, and still overridden by the master switch.
+            rdb: Some(RdbSpec::default()),
+            aof: Some(AofSpec::default()),
+        };
+        assert_eq!(
+            persistence_args(Some(&p)),
+            " --dir /data --save \"\" --appendonly no"
+        );
+    }
+
+    #[test]
+    fn persistence_disabling_rdb_keeps_aof() {
+        let p = PersistenceSpec {
+            rdb: Some(RdbSpec {
+                enabled: false,
+                save: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            persistence_args(Some(&p)),
+            " --dir /data --save \"\" --appendonly yes --appendfsync everysec"
+        );
+    }
+
+    #[test]
+    fn persistence_disabling_aof_keeps_rdb() {
+        let p = PersistenceSpec {
+            aof: Some(AofSpec {
+                enabled: false,
+                fsync: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            persistence_args(Some(&p)),
+            " --dir /data --save \"3600 1 300 100 60 10000\" --appendonly no"
+        );
+    }
+
+    #[test]
+    fn persistence_joins_save_points_into_one_arg() {
+        let p = PersistenceSpec {
+            rdb: Some(RdbSpec {
+                enabled: true,
+                save: Some(vec!["900 1".into(), "300 10".into()]),
+            }),
+            ..Default::default()
+        };
+        assert!(persistence_args(Some(&p)).contains("--save \"900 1 300 10\""));
+    }
+
+    #[test]
+    fn persistence_empty_save_list_disables_snapshots() {
+        let p = PersistenceSpec {
+            rdb: Some(RdbSpec {
+                enabled: true,
+                save: Some(vec![]),
+            }),
+            ..Default::default()
+        };
+        assert!(persistence_args(Some(&p)).contains("--save \"\""));
+    }
+
+    #[test]
+    fn persistence_never_maps_to_redis_no() {
+        let p = PersistenceSpec {
+            aof: Some(AofSpec {
+                enabled: true,
+                fsync: Some(FsyncPolicy::Never),
+            }),
+            ..Default::default()
+        };
+        assert!(persistence_args(Some(&p)).ends_with("--appendonly yes --appendfsync no"));
+    }
+
+    #[test]
+    fn persistence_always_is_passed_through() {
+        let p = PersistenceSpec {
+            aof: Some(AofSpec {
+                enabled: true,
+                fsync: Some(FsyncPolicy::Always),
+            }),
+            ..Default::default()
+        };
+        assert!(persistence_args(Some(&p)).ends_with("--appendfsync always"));
+    }
+
     #[test]
     fn parse_quantity_handles_binary_suffixes() {
         assert_eq!(parse_quantity_bytes("1Ki"), Some(1024));
@@ -548,7 +705,10 @@ mod tests {
     fn test_labels() -> BTreeMap<String, String> {
         BTreeMap::from([
             ("app.kubernetes.io/name".to_string(), "redis".to_string()),
-            ("app.kubernetes.io/instance".to_string(), "cache".to_string()),
+            (
+                "app.kubernetes.io/instance".to_string(),
+                "cache".to_string(),
+            ),
         ])
     }
 
@@ -736,7 +896,13 @@ mod tests {
             unhealthy_pod_eviction_policy: Some("AlwaysAllow".to_string()),
             ..Default::default()
         };
-        let pdb = build_pdb("cache", "ns", &test_labels(), OwnerReference::default(), &spec);
+        let pdb = build_pdb(
+            "cache",
+            "ns",
+            &test_labels(),
+            OwnerReference::default(),
+            &spec,
+        );
         assert_eq!(
             pdb.spec.unwrap().unhealthy_pod_eviction_policy.unwrap(),
             "AlwaysAllow"
@@ -758,7 +924,10 @@ mod tests {
     fn default_topology_spread_selector_matches_workload_labels() {
         let l = test_labels();
         let c = default_topology_spread(&l);
-        assert_eq!(c[0].label_selector.clone().unwrap().match_labels.unwrap(), l);
+        assert_eq!(
+            c[0].label_selector.clone().unwrap().match_labels.unwrap(),
+            l
+        );
     }
 
     #[test]
@@ -772,7 +941,10 @@ mod tests {
 
     #[test]
     fn effective_topology_spread_empty_vec_opts_out() {
-        assert_eq!(effective_topology_spread(Some(&vec![]), &test_labels()), None);
+        assert_eq!(
+            effective_topology_spread(Some(&vec![]), &test_labels()),
+            None
+        );
     }
 
     #[test]

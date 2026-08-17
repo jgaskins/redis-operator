@@ -44,6 +44,70 @@ spec:
               image:
                 default: redis:8
                 type: string
+              persistence:
+                description: |-
+                  How the dataset is written to disk. Defaults to both RDB and AOF on,
+                  with AOF fsyncing once a second. See `PersistenceSpec`.
+                nullable: true
+                properties:
+                  aof:
+                    description: Append-only file logging.
+                    nullable: true
+                    properties:
+                      enabled:
+                        default: true
+                        type: boolean
+                      fsync:
+                        description: |-
+                          Redis's `appendfsync` policy. Modelled as an enum so the API server rejects
+                          a bad value at `kubectl apply` time — redis-server refuses to start on an
+                          unrecognised one, which would otherwise surface as a CrashLoopBackOff.
+
+                          The third variant is spelled `never` rather than Redis's own `no`. `no` is
+                          unusable as a schema enum value here: serde_yaml emits it bare (YAML 1.2,
+                          where it is a string), but the API server parses CRDs with go-yaml's YAML
+                          1.1, where bare `no` is the boolean `false` — which would land a boolean
+                          inside a `type: string` enum and make the value unmatchable. Spelling it
+                          `never` sidesteps that, and spares users the same quoting trap in their own
+                          manifests. It maps to `appendfsync no` on the redis-server command line.
+                        enum:
+                        - always
+                        - everysec
+                        - never
+                        nullable: true
+                        type: string
+                    type: object
+                  enabled:
+                    default: true
+                    description: |-
+                      Master switch. When false, both RDB and AOF are disabled regardless of
+                      the `rdb` and `aof` blocks below and Redis runs as a pure in-memory
+                      cache, losing its dataset on every restart.
+                    type: boolean
+                  rdb:
+                    description: Point-in-time snapshotting (`save` / `BGSAVE`).
+                    nullable: true
+                    properties:
+                      enabled:
+                        default: true
+                        type: boolean
+                      save:
+                        description: |-
+                          Snapshot triggers, each `"<seconds> <changes>"` — snapshot when at
+                          least `changes` keys changed within `seconds`. Defaults to Redis's own
+                          `3600 1`, `300 100`, `60 10000`.
+
+                          An empty list schedules no automatic snapshots, which is the same thing
+                          `enabled: false` does: both emit `--save ""`. Neither stops Redis from
+                          producing an RDB for a replication full sync or an explicit `BGSAVE` —
+                          there is no Redis setting that does.
+                        items:
+                          pattern: ^\d+ \d+$
+                          type: string
+                        nullable: true
+                        type: array
+                    type: object
+                type: object
               podDisruptionBudget:
                 description: |-
                   Overrides the automatic PodDisruptionBudget for the Redis data pods.
@@ -534,6 +598,74 @@ spec:
                 default: 3
                 format: int32
                 type: integer
+              persistence:
+                description: |-
+                  How the dataset is written to disk. Defaults to both RDB and AOF on,
+                  with AOF fsyncing once a second. See `PersistenceSpec`.
+
+                  `/data` is mounted regardless of this setting, because the cluster's
+                  `nodes.conf` — the file holding each pod's cluster identity and slot
+                  map — lives there whether or not the dataset is persisted.
+                nullable: true
+                properties:
+                  aof:
+                    description: Append-only file logging.
+                    nullable: true
+                    properties:
+                      enabled:
+                        default: true
+                        type: boolean
+                      fsync:
+                        description: |-
+                          Redis's `appendfsync` policy. Modelled as an enum so the API server rejects
+                          a bad value at `kubectl apply` time — redis-server refuses to start on an
+                          unrecognised one, which would otherwise surface as a CrashLoopBackOff.
+
+                          The third variant is spelled `never` rather than Redis's own `no`. `no` is
+                          unusable as a schema enum value here: serde_yaml emits it bare (YAML 1.2,
+                          where it is a string), but the API server parses CRDs with go-yaml's YAML
+                          1.1, where bare `no` is the boolean `false` — which would land a boolean
+                          inside a `type: string` enum and make the value unmatchable. Spelling it
+                          `never` sidesteps that, and spares users the same quoting trap in their own
+                          manifests. It maps to `appendfsync no` on the redis-server command line.
+                        enum:
+                        - always
+                        - everysec
+                        - never
+                        nullable: true
+                        type: string
+                    type: object
+                  enabled:
+                    default: true
+                    description: |-
+                      Master switch. When false, both RDB and AOF are disabled regardless of
+                      the `rdb` and `aof` blocks below and Redis runs as a pure in-memory
+                      cache, losing its dataset on every restart.
+                    type: boolean
+                  rdb:
+                    description: Point-in-time snapshotting (`save` / `BGSAVE`).
+                    nullable: true
+                    properties:
+                      enabled:
+                        default: true
+                        type: boolean
+                      save:
+                        description: |-
+                          Snapshot triggers, each `"<seconds> <changes>"` — snapshot when at
+                          least `changes` keys changed within `seconds`. Defaults to Redis's own
+                          `3600 1`, `300 100`, `60 10000`.
+
+                          An empty list schedules no automatic snapshots, which is the same thing
+                          `enabled: false` does: both emit `--save ""`. Neither stops Redis from
+                          producing an RDB for a replication full sync or an explicit `BGSAVE` —
+                          there is no Redis setting that does.
+                        items:
+                          pattern: ^\d+ \d+$
+                          type: string
+                        nullable: true
+                        type: array
+                    type: object
+                type: object
               podDisruptionBudget:
                 description: |-
                   PodDisruptionBudget for the cluster's pods. Opt-in, and validated against
