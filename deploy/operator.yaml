@@ -87,9 +87,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: operator
-          image: jgaskins/redis-operator
-          # imagePullPolicy: IfNotPresent
-          imagePullPolicy: Always
+          image: jgaskins/redis-operator@sha256:66b6d4c1ff25102232305e7738a14a2933519c3566ac3c52683affccfafcb048
+          imagePullPolicy: IfNotPresent
           args: ["run"]
           env:
             - name: RUST_LOG
