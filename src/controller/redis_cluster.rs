@@ -67,7 +67,19 @@ pub async fn run(ctx: Arc<Context>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Times the reconcile and counts its outcome.
+///
+/// A wrapper rather than instrumentation inside the body, and rather than
+/// `error_policy`: the body has several early returns, and `error_policy` only
+/// ever sees the failures, so neither would count the successes exactly once.
 async fn reconcile(rc: Arc<RedisCluster>, ctx: Arc<Context>) -> Result<Action> {
+    let timer = ctx.metrics.reconcile_started("RedisCluster");
+    let result = reconcile_inner(rc, ctx.clone()).await;
+    timer.finish(result.is_ok());
+    result
+}
+
+async fn reconcile_inner(rc: Arc<RedisCluster>, ctx: Arc<Context>) -> Result<Action> {
     let name = rc.name_any();
     let ns = rc.namespace().ok_or(Error::MissingMetadata("namespace"))?;
     info!(%name, %ns, "reconciling RedisCluster");

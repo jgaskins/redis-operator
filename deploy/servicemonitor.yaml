@@ -1,0 +1,33 @@
+# Optional: Prometheus Operator scrape config for the operator's /metrics
+# endpoint. Kept out of operator.yaml because applying a
+# monitoring.coreos.com/v1 object fails outright on a cluster without the
+# Prometheus Operator CRDs installed.
+#
+#   kubectl apply -f deploy/servicemonitor.yaml
+#
+# Note that the operator dials Redis pod IPs directly on 6379/26379 to collect
+# these metrics. On a cluster with default-deny NetworkPolicies that path needs
+# an explicit allow, or every pod will report `redis_up 0`.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: redis-operator
+  namespace: redis-operator
+  labels:
+    app.kubernetes.io/name: redis-operator
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis-operator
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      # The per-pod metrics carry their own `namespace` and `pod` labels, which
+      # name the *Redis* pod they describe. Without this, target relabeling
+      # would rename them to exported_namespace/exported_pod and overwrite them
+      # with the operator's own pod — never what anyone querying
+      # redis_memory_used_bytes wants. The operator's own metrics are
+      # unaffected: honorLabels only takes effect on a conflict.
+      honorLabels: true

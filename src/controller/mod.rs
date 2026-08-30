@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use k8s_openapi::api::core::v1::{ObjectReference, ResourceRequirements, TopologySpreadConstraint};
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec as K8sPdbSpec};
@@ -15,6 +16,7 @@ use tracing::{info, warn};
 
 use crate::crd::redis::{PersistenceSpec, PodDisruptionBudgetSpec, ResourcesSpec};
 use crate::error::Result;
+use crate::metrics::Metrics;
 
 pub mod redis;
 pub mod redis_cluster;
@@ -25,10 +27,13 @@ pub const FIELD_MANAGER: &str = "redis-operator";
 pub struct Context {
     pub client: Client,
     pub recorder: Recorder,
+    /// Shared with the metrics server, which renders the same registry the
+    /// reconcile wrappers write to.
+    pub metrics: Arc<Metrics>,
 }
 
 impl Context {
-    pub fn new(client: Client) -> Self {
+    pub fn new(client: Client, metrics: Arc<Metrics>) -> Self {
         let reporter = Reporter {
             controller: FIELD_MANAGER.to_string(),
             // Set from the downward API in deploy/operator.yaml. Naming the pod
@@ -44,6 +49,7 @@ impl Context {
             // and flood the events API.
             recorder: Recorder::new(client.clone(), reporter),
             client,
+            metrics,
         }
     }
 }

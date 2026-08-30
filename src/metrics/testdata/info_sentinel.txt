@@ -1,0 +1,60 @@
+# Server
+redis_version:8.10.0
+redis_git_sha1:00000000
+redis_git_dirty:1
+redis_build_id:1e8a7369582ecb6d
+redis_mode:sentinel
+os:Linux 5.15.0-1111-azure x86_64
+arch_bits:64
+process_id:1
+run_id:9f0b2e9f0d0a4a1c8c2b5f7d3e6a1b4c9d8e7f60
+tcp_port:26379
+uptime_in_seconds:732580
+uptime_in_days:8
+hz:14
+configured_hz:10
+executable:/data/redis-sentinel
+config_file:/data/sentinel.conf
+
+# Clients
+connected_clients:4
+cluster_connections:0
+maxclients:10000
+blocked_clients:0
+tracking_clients:0
+pubsub_clients:2
+watching_clients:0
+
+# CPU
+used_cpu_sys:812.401233
+used_cpu_user:640.117845
+used_cpu_sys_children:0.000000
+used_cpu_user_children:0.000000
+
+# Stats
+total_connections_received:9812
+total_commands_processed:2044190
+instantaneous_ops_per_sec:6
+total_net_input_bytes:180244112
+total_net_output_bytes:402118330
+rejected_connections:0
+sync_full:0
+sync_partial_ok:0
+sync_partial_err:0
+expired_keys:0
+evicted_keys:0
+keyspace_hits:0
+keyspace_misses:0
+total_reads_processed:2044190
+total_writes_processed:2044190
+total_error_replies:3
+latest_fork_usec:0
+
+# Sentinel
+sentinel_masters:1
+sentinel_tilt:0
+sentinel_tilt_since_seconds:-1
+sentinel_running_scripts:0
+sentinel_scripts_queue_length:0
+sentinel_simulate_failure_flags:0
+master0:name=mymaster,status=ok,address=10.244.1.37:6379,slaves=2,sentinels=3

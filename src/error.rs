@@ -16,6 +16,12 @@ pub enum Error {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("redis protocol error: {0}")]
+    Resp(String),
+
+    #[error("timed out after {0:?}")]
+    Timeout(std::time::Duration),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

@@ -5,15 +5,17 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 k8s-openapi = { version = "0.27", features = ["latest", "schemars"] }
 kube = { version = "3", features = ["runtime", "derive", "client", "ws"] }
+prometheus-client = "0.25"
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-util", "net", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

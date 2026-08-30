@@ -90,6 +90,10 @@ spec:
           image: jgaskins/redis-operator@sha256:66b6d4c1ff25102232305e7738a14a2933519c3566ac3c52683affccfafcb048
           imagePullPolicy: IfNotPresent
           args: ["run"]
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
           env:
             - name: RUST_LOG
               value: info,kube=info
@@ -99,6 +103,25 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+          # Liveness catches a process that is alive but whose runtime has
+          # wedged — the failure mode where the controllers quietly stop
+          # reconciling and nothing restarts them. Readiness turns green once
+          # the metrics poller has listed pods successfully, which is the point
+          # at which the kube client is known to work.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 3
           resources:
             requests:
               cpu: 50m
@@ -111,3 +134,25 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-operator-metrics
+  namespace: redis-operator
+  labels:
+    app.kubernetes.io/name: redis-operator
+  annotations:
+    # Annotation-based scrape discovery. Harmless alongside the Prometheus
+    # Operator, which ignores these and uses deploy/servicemonitor.yaml.
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: /metrics
+spec:
+  selector:
+    app.kubernetes.io/name: redis-operator
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+      protocol: TCP
