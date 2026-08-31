@@ -25,7 +25,7 @@ use tracing::{info, warn};
 
 use crate::controller::{
     Context, FIELD_MANAGER, PdbRequest, PdbVerdict, apply, effective_redis_resources,
-    effective_topology_spread, maxmemory_bytes, persistence_args, reconcile_pdb,
+    effective_topology_spread, eviction_args, maxmemory_bytes, persistence_args, reconcile_pdb,
 };
 use crate::crd::RedisCluster;
 use crate::crd::redis_cluster::{NodeStatus, RedisClusterStatus, total_pods};
@@ -429,10 +429,11 @@ fn build_statefulset(rc: &RedisCluster, ns: &str, owner: OwnerReference) -> Stat
                                 --cluster-announce-hostname \
                                   \"$(hostname).{svc}.{ns}.svc.cluster.local\" \
                                 --cluster-preferred-endpoint-type hostname\
-                                {persistence}{maxmem}",
+                                {persistence}{maxmem}{eviction}",
                             svc = name,
                             ns = ns,
                             persistence = persistence_args(rc.spec.persistence.as_ref()),
+                            eviction = eviction_args(rc.spec.eviction_policy),
                         )]),
                         ports: Some(vec![
                             ContainerPort {
@@ -1180,6 +1181,7 @@ async fn pod_exec(client: &Client, ns: &str, pod: &str, cmd: &[String]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crd::redis::EvictionPolicy;
     use crate::crd::redis_cluster::RedisClusterSpec;
 
     #[test]
@@ -1209,6 +1211,34 @@ mod tests {
             c[0].label_selector.clone().unwrap().match_labels.unwrap(),
             labels("redis")
         );
+    }
+
+    #[test]
+    fn cluster_statefulset_carries_the_eviction_policy() {
+        let rc = RedisCluster::new(
+            "redis",
+            RedisClusterSpec {
+                eviction_policy: Some(EvictionPolicy::AllkeysLfu),
+                ..Default::default()
+            },
+        );
+        let sts = build_statefulset(&rc, "ns", OwnerReference::default());
+        let args = sts.spec.unwrap().template.spec.unwrap().containers[0]
+            .args
+            .clone()
+            .expect("container should have args");
+        assert!(args[0].contains("--maxmemory-policy allkeys-lfu"));
+    }
+
+    #[test]
+    fn cluster_statefulset_defaults_to_noeviction() {
+        let rc = RedisCluster::new("redis", RedisClusterSpec::default());
+        let sts = build_statefulset(&rc, "ns", OwnerReference::default());
+        let args = sts.spec.unwrap().template.spec.unwrap().containers[0]
+            .args
+            .clone()
+            .expect("container should have args");
+        assert!(args[0].contains("--maxmemory-policy noeviction"));
     }
 
     #[test]

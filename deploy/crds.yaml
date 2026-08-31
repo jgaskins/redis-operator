@@ -41,6 +41,39 @@ spec:
         properties:
           spec:
             properties:
+              evictionPolicy:
+                description: |-
+                  Redis's `maxmemory-policy`: what to do with the keyspace once `maxmemory`
+                  is reached. Modelled as an enum for the same reason `FsyncPolicy` is — the
+                  API server rejects a bad value at `kubectl apply` time, where redis-server
+                  would refuse to start and surface it as a CrashLoopBackOff instead.
+
+                  The `allkeys-*` variants may evict any key; the `volatile-*` variants only
+                  consider keys carrying a TTL, and behave like `noeviction` when none of the
+                  keys in memory have one — a cache built without TTLs gets write errors under
+                  a `volatile-*` policy, not evictions.
+
+                  Two things to weigh before moving off the default:
+
+                  - Eviction deletes committed data. An evicted key is dropped from the RDB
+                    and AOF along with everything else, so anything but `noeviction` turns the
+                    deployment into a cache whether or not persistence is on.
+                  - The ceiling is per pod. `maxmemory` is one node's limit, so under Redis
+                    Cluster the fullest shard starts evicting while the rest may be near
+                    empty, and the policy applies to every pod because a StatefulSet has a
+                    single pod template. Replicas don't evict independently — since Redis 5
+                    they wait for the primary's `DEL` — so it only acts on the current master.
+                enum:
+                - noeviction
+                - allkeys-lru
+                - allkeys-lfu
+                - allkeys-random
+                - volatile-lru
+                - volatile-lfu
+                - volatile-random
+                - volatile-ttl
+                nullable: true
+                type: string
               image:
                 default: redis:8
                 type: string
@@ -591,6 +624,39 @@ spec:
         properties:
           spec:
             properties:
+              evictionPolicy:
+                description: |-
+                  Redis's `maxmemory-policy`: what to do with the keyspace once `maxmemory`
+                  is reached. Modelled as an enum for the same reason `FsyncPolicy` is — the
+                  API server rejects a bad value at `kubectl apply` time, where redis-server
+                  would refuse to start and surface it as a CrashLoopBackOff instead.
+
+                  The `allkeys-*` variants may evict any key; the `volatile-*` variants only
+                  consider keys carrying a TTL, and behave like `noeviction` when none of the
+                  keys in memory have one — a cache built without TTLs gets write errors under
+                  a `volatile-*` policy, not evictions.
+
+                  Two things to weigh before moving off the default:
+
+                  - Eviction deletes committed data. An evicted key is dropped from the RDB
+                    and AOF along with everything else, so anything but `noeviction` turns the
+                    deployment into a cache whether or not persistence is on.
+                  - The ceiling is per pod. `maxmemory` is one node's limit, so under Redis
+                    Cluster the fullest shard starts evicting while the rest may be near
+                    empty, and the policy applies to every pod because a StatefulSet has a
+                    single pod template. Replicas don't evict independently — since Redis 5
+                    they wait for the primary's `DEL` — so it only acts on the current master.
+                enum:
+                - noeviction
+                - allkeys-lru
+                - allkeys-lfu
+                - allkeys-random
+                - volatile-lru
+                - volatile-lfu
+                - volatile-random
+                - volatile-ttl
+                nullable: true
+                type: string
               image:
                 default: redis:8
                 type: string

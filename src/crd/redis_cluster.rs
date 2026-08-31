@@ -3,7 +3,9 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::redis::{PersistenceSpec, PodDisruptionBudgetSpec, ResourcesSpec, StorageSpec};
+use super::redis::{
+    EvictionPolicy, PersistenceSpec, PodDisruptionBudgetSpec, ResourcesSpec, StorageSpec,
+};
 
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
 #[kube(
@@ -57,6 +59,21 @@ pub struct RedisClusterSpec {
     /// manually.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourcesSpec>,
+
+    /// What Redis does with the keyspace once a pod reaches `maxmemory`
+    /// (`maxmemory-policy`). Defaults to `noeviction`: writes that would exceed
+    /// the ceiling fail with an OOM error and nothing is dropped.
+    ///
+    /// Applies per pod, not per cluster: `maxmemory` is a single node's ceiling,
+    /// so eviction is driven by the fullest shard rather than by total cluster
+    /// memory. A hot slot range can therefore start evicting while the rest of
+    /// the cluster sits mostly empty.
+    ///
+    /// Eviction and persistence are a deliberate combination, not a default —
+    /// an evicted key is gone from the RDB/AOF too. Leave this at `noeviction`
+    /// unless the workload is a cache. See `EvictionPolicy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eviction_policy: Option<EvictionPolicy>,
 
     /// PodDisruptionBudget for the cluster's pods. Opt-in, and validated against
     /// the topology: the safe maximum is the smaller of the master-majority

@@ -48,6 +48,22 @@ pub struct RedisSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourcesSpec>,
 
+    /// What Redis does with the keyspace once it reaches `maxmemory`
+    /// (`maxmemory-policy`). Defaults to `noeviction`: writes that would
+    /// exceed the ceiling fail with an OOM error and nothing is dropped.
+    ///
+    /// The policy is applied to every pod, replicas included, because a
+    /// StatefulSet has one pod template and any replica may be promoted. That
+    /// is also the correct arrangement: since Redis 5 a replica does not evict
+    /// on its own, it waits for the primary's `DEL`, so the setting only takes
+    /// effect on whichever pod is currently master.
+    ///
+    /// Eviction and persistence are a deliberate combination, not a default —
+    /// an evicted key is gone from the RDB/AOF too. Leave this at `noeviction`
+    /// unless the workload is a cache. See `EvictionPolicy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eviction_policy: Option<EvictionPolicy>,
+
     /// How the dataset is written to disk. Defaults to both RDB and AOF on,
     /// with AOF fsyncing once a second. See `PersistenceSpec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -390,6 +406,71 @@ impl FsyncPolicy {
     }
 }
 
+/// Redis's `maxmemory-policy`: what to do with the keyspace once `maxmemory`
+/// is reached. Modelled as an enum for the same reason `FsyncPolicy` is — the
+/// API server rejects a bad value at `kubectl apply` time, where redis-server
+/// would refuse to start and surface it as a CrashLoopBackOff instead.
+///
+/// The `allkeys-*` variants may evict any key; the `volatile-*` variants only
+/// consider keys carrying a TTL, and behave like `noeviction` when none of the
+/// keys in memory have one — a cache built without TTLs gets write errors under
+/// a `volatile-*` policy, not evictions.
+///
+/// Two things to weigh before moving off the default:
+///
+/// - Eviction deletes committed data. An evicted key is dropped from the RDB
+///   and AOF along with everything else, so anything but `noeviction` turns the
+///   deployment into a cache whether or not persistence is on.
+/// - The ceiling is per pod. `maxmemory` is one node's limit, so under Redis
+///   Cluster the fullest shard starts evicting while the rest may be near
+///   empty, and the policy applies to every pod because a StatefulSet has a
+///   single pod template. Replicas don't evict independently — since Redis 5
+///   they wait for the primary's `DEL` — so it only acts on the current master.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvictionPolicy {
+    /// Evict nothing; reject writes that would exceed `maxmemory` with an OOM
+    /// error. Redis's own default, and the right one for a datastore — see the
+    /// note on `RedisSpec::eviction_policy` about replicas.
+    #[default]
+    #[serde(rename = "noeviction")]
+    NoEviction,
+    /// Approximated LRU over every key.
+    AllkeysLru,
+    /// Approximated LFU over every key. Usually the best cache policy: it
+    /// tracks access frequency, so a one-off scan of cold keys doesn't flush
+    /// the working set the way LRU allows.
+    AllkeysLfu,
+    /// Uniformly random over every key.
+    AllkeysRandom,
+    /// Approximated LRU, restricted to keys with a TTL.
+    VolatileLru,
+    /// Approximated LFU, restricted to keys with a TTL.
+    VolatileLfu,
+    /// Uniformly random, restricted to keys with a TTL.
+    VolatileRandom,
+    /// Shortest remaining TTL first.
+    VolatileTtl,
+}
+
+impl EvictionPolicy {
+    /// The literal `maxmemory-policy` value redis-server expects. Identical to
+    /// the serialised form, but spelled out rather than round-tripped through
+    /// serde so the command line can't drift if the schema naming changes.
+    pub fn as_redis_value(self) -> &'static str {
+        match self {
+            Self::NoEviction => "noeviction",
+            Self::AllkeysLru => "allkeys-lru",
+            Self::AllkeysLfu => "allkeys-lfu",
+            Self::AllkeysRandom => "allkeys-random",
+            Self::VolatileLru => "volatile-lru",
+            Self::VolatileLfu => "volatile-lfu",
+            Self::VolatileRandom => "volatile-random",
+            Self::VolatileTtl => "volatile-ttl",
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -449,6 +530,73 @@ fn default_image() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ALL_EVICTION_POLICIES: [EvictionPolicy; 8] = [
+        EvictionPolicy::NoEviction,
+        EvictionPolicy::AllkeysLru,
+        EvictionPolicy::AllkeysLfu,
+        EvictionPolicy::AllkeysRandom,
+        EvictionPolicy::VolatileLru,
+        EvictionPolicy::VolatileLfu,
+        EvictionPolicy::VolatileRandom,
+        EvictionPolicy::VolatileTtl,
+    ];
+
+    #[test]
+    fn eviction_policy_defaults_to_noeviction() {
+        assert_eq!(EvictionPolicy::default(), EvictionPolicy::NoEviction);
+        assert_eq!(EvictionPolicy::default().as_redis_value(), "noeviction");
+    }
+
+    #[test]
+    fn eviction_policy_covers_every_redis_policy() {
+        // The set redis-server accepts for `maxmemory-policy`. A variant added
+        // here without a matching entry — or vice versa — fails this.
+        let mut emitted: Vec<&str> = ALL_EVICTION_POLICIES
+            .iter()
+            .map(|p| p.as_redis_value())
+            .collect();
+        emitted.sort_unstable();
+        assert_eq!(
+            emitted,
+            [
+                "allkeys-lfu",
+                "allkeys-lru",
+                "allkeys-random",
+                "noeviction",
+                "volatile-lfu",
+                "volatile-lru",
+                "volatile-random",
+                "volatile-ttl",
+            ]
+        );
+    }
+
+    #[test]
+    fn eviction_policy_command_line_value_matches_the_accepted_api_value() {
+        // `as_redis_value` is hand-written; this is what keeps it from drifting
+        // away from what the CRD schema actually lets users apply.
+        for p in ALL_EVICTION_POLICIES {
+            let serialized = serde_json::to_string(&p).expect("policy should serialize");
+            assert_eq!(serialized, format!("\"{}\"", p.as_redis_value()));
+        }
+    }
+
+    #[test]
+    fn eviction_policy_deserializes_from_the_redis_spelling() {
+        for p in ALL_EVICTION_POLICIES {
+            let json = format!("\"{}\"", p.as_redis_value());
+            let parsed: EvictionPolicy =
+                serde_json::from_str(&json).expect("policy should deserialize");
+            assert_eq!(parsed, p);
+        }
+    }
+
+    #[test]
+    fn eviction_policy_rejects_an_unknown_value() {
+        assert!(serde_json::from_str::<EvictionPolicy>("\"allkeys-ttl\"").is_err());
+        assert!(serde_json::from_str::<EvictionPolicy>("\"no-eviction\"").is_err());
+    }
 
     fn sentinel(replicas: i32, quorum: Option<i32>) -> SentinelSpec {
         SentinelSpec {

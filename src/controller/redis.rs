@@ -26,7 +26,8 @@ use tracing::{info, warn};
 
 use crate::controller::{
     Context, FIELD_MANAGER, PdbRequest, PdbVerdict, apply, effective_redis_resources,
-    effective_topology_spread, emit, maxmemory_bytes, persistence_args, reconcile_pdb,
+    effective_topology_spread, emit, eviction_args, maxmemory_bytes, persistence_args,
+    reconcile_pdb,
 };
 use crate::crd::Redis;
 use crate::crd::redis::{PodDisruptionBudgetSpec, RedisSpec, ResourcesSpec, SentinelSpec};
@@ -569,8 +570,9 @@ fn build_redis_args(redis: &Redis, ns: &str) -> Vec<String> {
         .map(|b| format!(" --maxmemory {b}"))
         .unwrap_or_default();
     let extra = format!(
-        "{}{maxmem}",
-        persistence_args(redis.spec.persistence.as_ref())
+        "{}{maxmem}{}",
+        persistence_args(redis.spec.persistence.as_ref()),
+        eviction_args(redis.spec.eviction_policy),
     );
 
     let script = if redis.spec.sentinel.is_some() {
@@ -1175,7 +1177,7 @@ async fn pod_exec(client: &Client, ns: &str, pod: &str, cmd: &[&str]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::redis::RedisSpec;
+    use crate::crd::redis::{EvictionPolicy, RedisSpec};
 
     fn args_for(spec: RedisSpec) -> String {
         let mut r = Redis::new("cache", spec);
@@ -1213,6 +1215,36 @@ mod tests {
         }
         // The one directive the conf exists to carry must not be stripped.
         assert!(!sed.contains("replicaof"));
+    }
+
+    #[test]
+    fn redis_args_carry_the_eviction_policy() {
+        let script = args_for(RedisSpec {
+            eviction_policy: Some(EvictionPolicy::AllkeysLru),
+            ..Default::default()
+        });
+        assert!(script.contains("--maxmemory-policy allkeys-lru"));
+    }
+
+    #[test]
+    fn redis_args_default_to_noeviction_on_every_start_path() {
+        // Both the master and the replica branch of the non-Sentinel script
+        // spell out the flag, so a promoted replica evicts identically.
+        let script = args_for(RedisSpec::default());
+        assert_eq!(script.matches("--maxmemory-policy noeviction").count(), 2);
+    }
+
+    #[test]
+    fn sentinel_args_carry_the_eviction_policy() {
+        // Passed on the command line rather than written to the conf, so it
+        // survives — and overrides — the CONFIG REWRITE Sentinel does on
+        // failover.
+        let script = args_for(RedisSpec {
+            sentinel: Some(SentinelSpec::default()),
+            eviction_policy: Some(EvictionPolicy::VolatileTtl),
+            ..Default::default()
+        });
+        assert!(script.contains("--maxmemory-policy volatile-ttl"));
     }
 
     #[test]

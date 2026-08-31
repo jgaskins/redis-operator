@@ -14,7 +14,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::crd::redis::{PersistenceSpec, PodDisruptionBudgetSpec, ResourcesSpec};
+use crate::crd::redis::{EvictionPolicy, PersistenceSpec, PodDisruptionBudgetSpec, ResourcesSpec};
 use crate::error::Result;
 use crate::metrics::Metrics;
 
@@ -158,6 +158,22 @@ pub fn persistence_args(user: Option<&PersistenceSpec>) -> String {
         args.push_str(" --appendonly no");
     }
     args
+}
+
+/// The `--maxmemory-policy` flag for an `EvictionPolicy`, ready to be appended
+/// to the command line. Includes the leading space; returns the flag for the
+/// default (`noeviction`) when `user` is `None`.
+///
+/// Emitted unconditionally, and as a command-line flag rather than a conf
+/// entry, for the same reasons `persistence_args` is: arguments are applied
+/// after the config file, so clearing the field on the CR reverts the pod to
+/// `noeviction` even when `CONFIG REWRITE` — which Sentinel runs on failover —
+/// has already persisted a policy into `redis.conf`.
+pub fn eviction_args(user: Option<EvictionPolicy>) -> String {
+    format!(
+        " --maxmemory-policy {}",
+        user.unwrap_or_default().as_redis_value()
+    )
 }
 
 /// Compute the `--maxmemory` value to pass to redis-server: 70% of the
@@ -626,6 +642,19 @@ mod tests {
             ..Default::default()
         };
         assert!(persistence_args(Some(&p)).ends_with("--appendfsync always"));
+    }
+
+    #[test]
+    fn eviction_defaults_to_noeviction() {
+        assert_eq!(eviction_args(None), " --maxmemory-policy noeviction");
+    }
+
+    #[test]
+    fn eviction_passes_the_configured_policy_through() {
+        assert_eq!(
+            eviction_args(Some(EvictionPolicy::AllkeysLfu)),
+            " --maxmemory-policy allkeys-lfu"
+        );
     }
 
     #[test]
