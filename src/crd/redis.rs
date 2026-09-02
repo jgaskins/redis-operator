@@ -119,6 +119,23 @@ pub struct SentinelSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quorum: Option<i32>,
 
+    /// Name this Sentinel set uses for the monitored master. Defaults to
+    /// `mymaster`. Worth setting when several Redis instances share one
+    /// Sentinel deployment, or to match a name clients are already
+    /// configured with.
+    ///
+    /// Restricted to the characters Sentinel itself accepts in a master
+    /// name — alphanumerics, `.`, `_` and `-`.
+    ///
+    /// Changing it on a running instance is disruptive: `sentinel.conf` is
+    /// only written on first boot, so existing sentinels keep monitoring the
+    /// old name while the operator asks for the new one, and master tracking
+    /// stalls on the last known selector. Recreate the sentinel pods (and
+    /// their PVCs, if `storage` is set) to adopt the new name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("pattern" = r"^[A-Za-z0-9._-]+$", "maxLength" = 128))]
+    pub master_name: Option<String>,
+
     /// Override image for Sentinel pods. Defaults to the Redis spec image —
     /// `redis-sentinel` ships in the same container as `redis-server`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,11 +233,20 @@ pub struct PodDisruptionBudgetSpec {
     pub unhealthy_pod_eviction_policy: Option<String>,
 }
 
+/// Sentinel's own default master name, and the operator's when
+/// `sentinel.masterName` is unset.
+pub const DEFAULT_MASTER_NAME: &str = "mymaster";
+
 impl SentinelSpec {
     /// Effective quorum: explicit value if set, otherwise majority of
     /// `replicas` (e.g. 2 of 3).
     pub fn effective_quorum(&self) -> i32 {
         self.quorum.unwrap_or(self.replicas / 2 + 1)
+    }
+
+    /// Effective master name: explicit value if set, otherwise `mymaster`.
+    pub fn effective_master_name(&self) -> &str {
+        self.master_name.as_deref().unwrap_or(DEFAULT_MASTER_NAME)
     }
 
     /// Sentinels that must stay up for failover to still work.
@@ -604,6 +630,20 @@ mod tests {
             quorum,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn sentinel_master_name_defaults_to_mymaster() {
+        assert_eq!(sentinel(3, None).effective_master_name(), "mymaster");
+    }
+
+    #[test]
+    fn sentinel_master_name_honors_an_explicit_value() {
+        let spec = SentinelSpec {
+            master_name: Some("cache-primary".into()),
+            ..sentinel(3, None)
+        };
+        assert_eq!(spec.effective_master_name(), "cache-primary");
     }
 
     #[test]

@@ -221,6 +221,25 @@ spec:
                       `redis-sentinel` ships in the same container as `redis-server`.
                     nullable: true
                     type: string
+                  masterName:
+                    description: |-
+                      Name this Sentinel set uses for the monitored master. Defaults to
+                      `mymaster`. Worth setting when several Redis instances share one
+                      Sentinel deployment, or to match a name clients are already
+                      configured with.
+
+                      Restricted to the characters Sentinel itself accepts in a master
+                      name — alphanumerics, `.`, `_` and `-`.
+
+                      Changing it on a running instance is disruptive: `sentinel.conf` is
+                      only written on first boot, so existing sentinels keep monitoring the
+                      old name while the operator asks for the new one, and master tracking
+                      stalls on the last known selector. Recreate the sentinel pods (and
+                      their PVCs, if `storage` is set) to adopt the new name.
+                    maxLength: 128
+                    nullable: true
+                    pattern: ^[A-Za-z0-9._-]+$
+                    type: string
                   podDisruptionBudget:
                     description: |-
                       Overrides the automatic Sentinel PodDisruptionBudget.

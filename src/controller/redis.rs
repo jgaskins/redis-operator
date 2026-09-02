@@ -39,9 +39,6 @@ const DATA_VOLUME: &str = "data";
 /// Label automatically set by the StatefulSet controller on each pod.
 /// Used to select the current master pod in the primary Service.
 const POD_NAME_LABEL: &str = "statefulset.kubernetes.io/pod-name";
-/// Sentinel master-name. Hard-coded for now — could become a spec field if
-/// users start running multiple Redis instances behind a shared sentinel set.
-const MASTER_NAME: &str = "mymaster";
 /// Operator-managed label distinguishing master from replica pods. Drives the
 /// replicas Service selector; updated each reconcile to track failovers.
 const ROLE_LABEL: &str = "redis-operator/role";
@@ -575,8 +572,9 @@ fn build_redis_args(redis: &Redis, ns: &str) -> Vec<String> {
         eviction_args(redis.spec.eviction_policy),
     );
 
-    let script = if redis.spec.sentinel.is_some() {
+    let script = if let Some(sentinel) = redis.spec.sentinel.as_ref() {
         let sentinel_svc = sentinel_sts_name(&name);
+        let master_name = sentinel.effective_master_name();
         format!(
             r#"set -eu
 CONF=/data/redis.conf
@@ -585,7 +583,7 @@ ORD=${{HOSTNAME##*-}}
 if [ ! -f "$CONF" ]; then
   REPLICAOF=""
   if getent hosts "{sentinel_svc}" >/dev/null 2>&1; then
-    MASTER_INFO=$(timeout 2 redis-cli -h "{sentinel_svc}" -p {SENTINEL_PORT} sentinel get-master-addr-by-name {MASTER_NAME} 2>/dev/null || true)
+    MASTER_INFO=$(timeout 2 redis-cli -h "{sentinel_svc}" -p {SENTINEL_PORT} sentinel get-master-addr-by-name {master_name} 2>/dev/null || true)
     MASTER_HOST=$(echo "$MASTER_INFO" | head -n 1 | tr -d '"')
     if [ -n "$MASTER_HOST" ] && [ "$MASTER_HOST" != "$HOST" ]; then
       REPLICAOF="replicaof $MASTER_HOST {REDIS_PORT}"
@@ -803,6 +801,7 @@ fn build_sentinel_args(redis: &Redis, ns: &str, sentinel: &SentinelSpec) -> Vec<
     let sentinel_svc = sentinel_sts_name(&name);
     let primary = primary_hostname(&name, ns);
     let quorum = sentinel.effective_quorum();
+    let master_name = sentinel.effective_master_name();
     let script = format!(
         r#"set -eu
 CONF=/data/sentinel.conf
@@ -814,10 +813,10 @@ sentinel announce-ip $HOST
 sentinel announce-port {SENTINEL_PORT}
 sentinel resolve-hostnames yes
 sentinel announce-hostnames yes
-sentinel monitor {MASTER_NAME} {primary} {REDIS_PORT} {quorum}
-sentinel down-after-milliseconds {MASTER_NAME} 5000
-sentinel failover-timeout {MASTER_NAME} 10000
-sentinel parallel-syncs {MASTER_NAME} 1
+sentinel monitor {master_name} {primary} {REDIS_PORT} {quorum}
+sentinel down-after-milliseconds {master_name} 5000
+sentinel failover-timeout {master_name} 10000
+sentinel parallel-syncs {master_name} 1
 EOF
 fi
 # Heal duplicate known-replica/known-sentinel lines that upstream Sentinel
@@ -1005,12 +1004,13 @@ async fn determine_master_pod(
     let name = redis.name_any();
     let pod0 = format!("{name}-0");
 
-    if redis.spec.sentinel.is_none() {
+    let Some(sentinel) = redis.spec.sentinel.as_ref() else {
         return Ok(pod0);
-    }
+    };
 
     let sentinel_pod = format!("{}-0", sentinel_sts_name(&name));
-    match query_sentinel_master(client, ns, &sentinel_pod).await {
+    let master_name = sentinel.effective_master_name();
+    match query_sentinel_master(client, ns, &sentinel_pod, master_name).await {
         Ok(Some(host)) => match master_pod_from_host(&host) {
             Some(pod) => Ok(pod),
             None => {
@@ -1072,7 +1072,12 @@ async fn preserve_existing_master(
     Ok(existing.unwrap_or_else(|| fallback.to_string()))
 }
 
-async fn query_sentinel_master(client: &Client, ns: &str, pod: &str) -> Result<Option<String>> {
+async fn query_sentinel_master(
+    client: &Client,
+    ns: &str,
+    pod: &str,
+    master_name: &str,
+) -> Result<Option<String>> {
     let out = pod_exec(
         client,
         ns,
@@ -1083,7 +1088,7 @@ async fn query_sentinel_master(client: &Client, ns: &str, pod: &str) -> Result<O
             "26379",
             "sentinel",
             "get-master-addr-by-name",
-            MASTER_NAME,
+            master_name,
         ],
     )
     .await?;
@@ -1469,6 +1474,68 @@ mod tests {
                 "replicas {replicas}"
             );
         }
+    }
+
+    fn sentinel_conf_for(sentinel: SentinelSpec) -> String {
+        let mut r = Redis::new(
+            "cache",
+            RedisSpec {
+                sentinel: Some(sentinel.clone()),
+                ..Default::default()
+            },
+        );
+        r.meta_mut().namespace = Some("ns".into());
+        build_sentinel_args(&r, "ns", &sentinel)[2].clone()
+    }
+
+    #[test]
+    fn sentinel_conf_defaults_to_mymaster() {
+        let conf = sentinel_conf_for(SentinelSpec {
+            replicas: 3,
+            ..Default::default()
+        });
+        assert!(
+            conf.contains("sentinel monitor mymaster cache-0.cache.ns.svc.cluster.local 6379 2"),
+            "{conf}"
+        );
+    }
+
+    #[test]
+    fn sentinel_conf_uses_the_configured_master_name() {
+        // Every per-master directive has to name the same master, or Sentinel
+        // rejects the conf for referencing an unmonitored master.
+        let conf = sentinel_conf_for(SentinelSpec {
+            replicas: 3,
+            master_name: Some("cache-primary".into()),
+            ..Default::default()
+        });
+        assert!(!conf.contains("mymaster"), "{conf}");
+        for directive in [
+            "sentinel monitor cache-primary",
+            "sentinel down-after-milliseconds cache-primary",
+            "sentinel failover-timeout cache-primary",
+            "sentinel parallel-syncs cache-primary",
+        ] {
+            assert!(conf.contains(directive), "missing {directive} in {conf}");
+        }
+    }
+
+    #[test]
+    fn redis_bootstrap_asks_sentinel_for_the_configured_master_name() {
+        // The data pods discover their replication target through the same
+        // name the sentinels monitor, so the two must not drift apart.
+        let script = args_for(RedisSpec {
+            sentinel: Some(SentinelSpec {
+                replicas: 3,
+                master_name: Some("cache-primary".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(
+            script.contains("sentinel get-master-addr-by-name cache-primary"),
+            "{script}"
+        );
     }
 
     #[test]
