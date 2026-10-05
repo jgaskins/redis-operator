@@ -80,7 +80,8 @@ spec:
               persistence:
                 description: |-
                   How the dataset is written to disk. Defaults to both RDB and AOF on,
-                  with AOF fsyncing once a second. See `PersistenceSpec`.
+                  with AOF fsyncing once a second. The two don't build on each other —
+                  with AOF on, the RDB file is never loaded. See `PersistenceSpec`.
                 nullable: true
                 properties:
                   aof:
@@ -343,8 +344,20 @@ spec:
                         type: object
                       size:
                         default: 1Gi
+                        description: |-
+                          Size requested for each pod's volume. Raising it grows the existing
+                          PVCs in place, which needs a storage class with `allowVolumeExpansion`.
+                          Lowering it does nothing, because Kubernetes can't shrink a volume. The
+                          StatefulSet's own claim template keeps its original size, since that
+                          field can't be changed after creation.
                         type: string
                       storageClass:
+                        description: |-
+                          Fixed at creation. Changing it, or adding or removing `storage`
+                          altogether, leaves the StatefulSet un-updated and the CR `Degraded`
+                          until the StatefulSet is recreated (`kubectl delete statefulset <name>
+                          --cascade=orphan` keeps the pods running while the operator recreates
+                          it).
                         nullable: true
                         type: string
                     type: object
@@ -457,8 +470,20 @@ spec:
                     type: object
                   size:
                     default: 1Gi
+                    description: |-
+                      Size requested for each pod's volume. Raising it grows the existing
+                      PVCs in place, which needs a storage class with `allowVolumeExpansion`.
+                      Lowering it does nothing, because Kubernetes can't shrink a volume. The
+                      StatefulSet's own claim template keeps its original size, since that
+                      field can't be changed after creation.
                     type: string
                   storageClass:
+                    description: |-
+                      Fixed at creation. Changing it, or adding or removing `storage`
+                      altogether, leaves the StatefulSet un-updated and the CR `Degraded`
+                      until the StatefulSet is recreated (`kubectl delete statefulset <name>
+                      --cascade=orphan` keeps the pods running while the operator recreates
+                      it).
                     nullable: true
                     type: string
                 type: object
@@ -829,8 +854,20 @@ spec:
                     type: object
                   size:
                     default: 1Gi
+                    description: |-
+                      Size requested for each pod's volume. Raising it grows the existing
+                      PVCs in place, which needs a storage class with `allowVolumeExpansion`.
+                      Lowering it does nothing, because Kubernetes can't shrink a volume. The
+                      StatefulSet's own claim template keeps its original size, since that
+                      field can't be changed after creation.
                     type: string
                   storageClass:
+                    description: |-
+                      Fixed at creation. Changing it, or adding or removing `storage`
+                      altogether, leaves the StatefulSet un-updated and the CR `Degraded`
+                      until the StatefulSet is recreated (`kubectl delete statefulset <name>
+                      --cascade=orphan` keeps the pods running while the operator recreates
+                      it).
                     nullable: true
                     type: string
                 type: object

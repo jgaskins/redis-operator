@@ -23,9 +23,11 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tracing::{info, warn};
 
+use crate::controller::statefulset::{StatefulSetOutcome, apply_statefulset};
 use crate::controller::{
-    Context, FIELD_MANAGER, PdbRequest, PdbVerdict, apply, effective_redis_resources,
-    effective_topology_spread, eviction_args, maxmemory_bytes, persistence_args, reconcile_pdb,
+    Context, FIELD_MANAGER, PdbRequest, PdbVerdict, REDIS_TERMINATION_GRACE_SECONDS, apply,
+    effective_redis_resources, effective_topology_spread, eviction_args, maxmemory_bytes,
+    persistence_args, reconcile_pdb,
 };
 use crate::crd::RedisCluster;
 use crate::crd::redis_cluster::{NodeStatus, RedisClusterStatus, total_pods};
@@ -113,11 +115,17 @@ async fn reconcile_inner(rc: Arc<RedisCluster>, ctx: Arc<Context>) -> Result<Act
         drain_for_scale_down(&ctx.client, &ns, &name, total, current_replicas).await?;
     }
 
-    apply(&sts_api, &name, &build_statefulset(&rc, &ns, owner.clone())).await?;
+    let obj_ref = rc.object_ref(&());
+    let sts_outcome = apply_statefulset(
+        &ctx,
+        &ns,
+        &obj_ref,
+        build_statefulset(&rc, &ns, owner.clone()),
+    )
+    .await?;
 
     // After the StatefulSet, never before: a rejected budget must not be able to
     // stop the workload itself from reconciling.
-    let obj_ref = rc.object_ref(&());
     let pdb_verdict = reconcile_pdb(
         &pdb_api,
         &ctx,
@@ -134,7 +142,8 @@ async fn reconcile_inner(rc: Arc<RedisCluster>, ctx: Arc<Context>) -> Result<Act
     )
     .await?;
 
-    if !pdb_verdict.should_apply() && pdb_verdict != PdbVerdict::Empty {
+    let pdb_refused = !pdb_verdict.should_apply() && pdb_verdict != PdbVerdict::Empty;
+    if pdb_refused || sts_outcome == StatefulSetOutcome::Blocked {
         set_phase(&rc_api, &name, "Degraded").await?;
         return Ok(Action::requeue(Duration::from_secs(60)));
     }
@@ -457,6 +466,7 @@ fn build_statefulset(rc: &RedisCluster, ns: &str, owner: OwnerReference) -> Stat
                     }],
                     topology_spread_constraints: spread,
                     volumes: pod_volumes,
+                    termination_grace_period_seconds: Some(REDIS_TERMINATION_GRACE_SECONDS),
                     ..Default::default()
                 }),
             },

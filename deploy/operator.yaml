@@ -35,6 +35,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch", "patch"]
+  # Growing volumes in place when `storage.size` is raised; the StatefulSet's
+  # own claim templates are immutable.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "patch"]
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["get", "create"]

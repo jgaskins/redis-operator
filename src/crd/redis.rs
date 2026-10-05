@@ -65,7 +65,8 @@ pub struct RedisSpec {
     pub eviction_policy: Option<EvictionPolicy>,
 
     /// How the dataset is written to disk. Defaults to both RDB and AOF on,
-    /// with AOF fsyncing once a second. See `PersistenceSpec`.
+    /// with AOF fsyncing once a second. The two don't build on each other —
+    /// with AOF on, the RDB file is never loaded. See `PersistenceSpec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistence: Option<PersistenceSpec>,
 
@@ -286,8 +287,18 @@ impl RedisSpec {
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageSpec {
+    /// Size requested for each pod's volume. Raising it grows the existing
+    /// PVCs in place, which needs a storage class with `allowVolumeExpansion`.
+    /// Lowering it does nothing, because Kubernetes can't shrink a volume. The
+    /// StatefulSet's own claim template keeps its original size, since that
+    /// field can't be changed after creation.
     #[serde(default = "default_storage_size")]
     pub size: String,
+    /// Fixed at creation. Changing it, or adding or removing `storage`
+    /// altogether, leaves the StatefulSet un-updated and the CR `Degraded`
+    /// until the StatefulSet is recreated (`kubectl delete statefulset <name>
+    /// --cascade=orphan` keeps the pods running while the operator recreates
+    /// it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -301,12 +312,29 @@ fn default_storage_size() -> String {
 /// How the dataset is written to disk so it survives a restart.
 ///
 /// Omitting this block means the same as `{}`: both RDB and AOF enabled, AOF
-/// fsyncing every second. The pair is the default because they recover
-/// different things. AOF bounds data loss to roughly one second of writes,
-/// while RDB gives a compact snapshot that loads faster and — the part that
-/// matters on a rolling update — carries the replication ID and offset in its
-/// aux fields, letting a restarted replica ask its master for a *partial*
-/// resync instead of forcing a fork-and-ship of the entire dataset.
+/// fsyncing every second.
+///
+/// The two are independent, and enabling both does not make the AOF build on
+/// the RDB snapshots. The AOF already contains its own snapshot: its base file
+/// (`appendonlydir/*.base.rdb`) is an RDB written by the AOF rewrite, which
+/// runs whenever the incremental file outgrows the base, and the incremental
+/// file logs only writes made since. `dump.rdb` comes from the `save` points
+/// and the AOF never reads it.
+///
+/// With AOF on, Redis loads only the AOF at startup and ignores `dump.rdb`
+/// entirely, including the replication ID and offset in its aux fields that
+/// would otherwise let a restarted replica partially resync. So with both
+/// enabled, `dump.rdb` is a second full copy of the dataset on disk that is
+/// never loaded, and each `save` point forks the process and rewrites it all
+/// over again. Once writes exceed 10,000 keys a minute, the default `60 10000`
+/// point keeps a snapshot running almost continuously. Plan for disk headroom on top of that: just before a
+/// rewrite the AOF is about twice the dataset, and the rewrite writes a new
+/// base before deleting the old files.
+///
+/// Choose one unless the RDB file is wanted as something to copy off the node.
+/// AOF alone bounds loss to roughly a second of writes. RDB alone loses
+/// everything since the last snapshot, but is far lighter on disk and I/O, and
+/// a restarted replica can partially resync from it.
 ///
 /// Applies uniformly to every pod in the workload, and deliberately so. Roles
 /// are not fixed here: under Sentinel or Redis Cluster any pod may be promoted

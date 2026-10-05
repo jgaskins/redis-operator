@@ -20,8 +20,19 @@ use crate::metrics::Metrics;
 
 pub mod redis;
 pub mod redis_cluster;
+pub mod statefulset;
 
 pub const FIELD_MANAGER: &str = "redis-operator";
+
+/// `terminationGracePeriodSeconds` for Redis data pods.
+///
+/// On SIGTERM redis-server finishes its shutdown work before exiting: with RDB
+/// enabled it writes a full foreground snapshot, which for a multi-gigabyte
+/// dataset takes on the order of a minute. The Kubernetes default of 30s
+/// SIGKILLs it part-way through, leaving an orphaned `temp-1.rdb` on the volume
+/// and the pod restarting from an older snapshot. Redis exits as soon as it is
+/// done, so the extra headroom costs nothing on a pod that shuts down quickly.
+pub const REDIS_TERMINATION_GRACE_SECONDS: i64 = 120;
 
 #[derive(Clone)]
 pub struct Context {

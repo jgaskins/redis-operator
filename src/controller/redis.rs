@@ -24,10 +24,11 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tracing::{info, warn};
 
+use crate::controller::statefulset::{StatefulSetOutcome, apply_statefulset};
 use crate::controller::{
-    Context, FIELD_MANAGER, PdbRequest, PdbVerdict, apply, effective_redis_resources,
-    effective_topology_spread, emit, eviction_args, maxmemory_bytes, persistence_args,
-    reconcile_pdb,
+    Context, FIELD_MANAGER, PdbRequest, PdbVerdict, REDIS_TERMINATION_GRACE_SECONDS, apply,
+    effective_redis_resources, effective_topology_spread, emit, eviction_args, maxmemory_bytes,
+    persistence_args, reconcile_pdb,
 };
 use crate::crd::Redis;
 use crate::crd::redis::{PodDisruptionBudgetSpec, RedisSpec, ResourcesSpec, SentinelSpec};
@@ -108,10 +109,11 @@ async fn reconcile_inner(redis: Arc<Redis>, ctx: Arc<Context>) -> Result<Action>
         &build_headless_service(&redis, &ns, owner.clone()),
     )
     .await?;
-    apply(
-        &sts_api,
-        &name,
-        &build_redis_statefulset(&redis, &ns, owner.clone()),
+    let data_sts = apply_statefulset(
+        &ctx,
+        &ns,
+        &obj_ref,
+        build_redis_statefulset(&redis, &ns, owner.clone()),
     )
     .await?;
     apply(
@@ -145,6 +147,7 @@ async fn reconcile_inner(redis: Arc<Redis>, ctx: Arc<Context>) -> Result<Action>
 
     let sentinel_name = sentinel_sts_name(&name);
     let mut sentinel_verdict = PdbVerdict::Empty;
+    let mut sentinel_sts = StatefulSetOutcome::Applied;
     if let Some(sentinel_spec) = redis.spec.sentinel.as_ref() {
         apply(
             &svc_api,
@@ -152,10 +155,11 @@ async fn reconcile_inner(redis: Arc<Redis>, ctx: Arc<Context>) -> Result<Action>
             &build_sentinel_headless_service(&redis, &ns, owner.clone()),
         )
         .await?;
-        apply(
-            &sts_api,
-            &sentinel_name,
-            &build_sentinel_statefulset(&redis, &ns, sentinel_spec, owner.clone()),
+        sentinel_sts = apply_statefulset(
+            &ctx,
+            &ns,
+            &obj_ref,
+            build_sentinel_statefulset(&redis, &ns, sentinel_spec, owner.clone()),
         )
         .await?;
 
@@ -242,7 +246,10 @@ async fn reconcile_inner(redis: Arc<Redis>, ctx: Arc<Context>) -> Result<Action>
     let pdb_refused = [&data_verdict, &sentinel_verdict]
         .iter()
         .any(|v| !v.should_apply() && **v != PdbVerdict::Empty);
-    let phase = if pdb_refused {
+    // Likewise a StatefulSet left at its old spec: the pods may all be ready,
+    // but not running what the CR asks for.
+    let sts_blocked = [data_sts, sentinel_sts].contains(&StatefulSetOutcome::Blocked);
+    let phase = if pdb_refused || sts_blocked {
         "Degraded"
     } else if ready == redis.spec.replicas && redis.spec.replicas > 0 {
         "Running"
@@ -728,6 +735,7 @@ fn build_redis_statefulset(redis: &Redis, ns: &str, owner: OwnerReference) -> St
                     }],
                     topology_spread_constraints: spread,
                     volumes: pod_volumes,
+                    termination_grace_period_seconds: Some(REDIS_TERMINATION_GRACE_SECONDS),
                     ..Default::default()
                 }),
             },
