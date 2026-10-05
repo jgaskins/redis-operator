@@ -92,7 +92,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: operator
-          image: jgaskins/redis-operator@sha256:f43a234144f3a8fb6ac80338d919466d53d7da0950332a7c4e98528148269bac
+          image: jgaskins/redis-operator@sha256:2f0c6daa6e8db5f605297c99de6a9482941c92975d55702cdc97a38a1f8e61f7
           imagePullPolicy: IfNotPresent
           args: ["run"]
           ports:
